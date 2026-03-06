@@ -1,0 +1,22 @@
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+index cb67c74f..51756b5f 100644
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -257,7 +257,7 @@ void qmv(
+   std::string kname;
+   kname.reserve(64);
+   std::string type_string = get_type_string(x.dtype());
+-  bool fast = N % bn == 0 && K % 512 == 0;
++  bool fast = N % bn == 0 && K % 512 == 0 && bits >= 2;
+ 
+   concatenate(
+       kname,
+@@ -888,7 +888,7 @@ void gather_qmv(
+   std::string kname;
+   kname.reserve(64);
+   std::string type_string = get_type_string(x.dtype());
+-  bool fast = N % bn == 0 && K % 512 == 0;
++  bool fast = N % bn == 0 && K % 512 == 0 && bits >= 2;
+   concatenate(
+       kname,
+       mode + (fast ? "_gather_qmv_fast_" : "_gather_qmv_"),
