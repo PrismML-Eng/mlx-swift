@@ -246,16 +246,17 @@ inline U qdot(
   U accum = 0;
 
   if (bits == 1) {
-    for (int i = 0; i < (values_per_thread / 8); i++) {
-      uint8_t wb = w[i];
-      accum += select(U(0), x_thread[8 * i], bool(wb & 0x01));
-      accum += select(U(0), x_thread[8 * i + 1], bool(wb & 0x02));
-      accum += select(U(0), x_thread[8 * i + 2], bool(wb & 0x04));
-      accum += select(U(0), x_thread[8 * i + 3], bool(wb & 0x08));
-      accum += select(U(0), x_thread[8 * i + 4], bool(wb & 0x10));
-      accum += select(U(0), x_thread[8 * i + 5], bool(wb & 0x20));
-      accum += select(U(0), x_thread[8 * i + 6], bool(wb & 0x40));
-      accum += select(U(0), x_thread[8 * i + 7], bool(wb & 0x80));
+    // Wider load: read 4 packed bytes as one 32-bit word (1 load instead of 4
+    // byte loads) and extract the same 32 one-bit weights. Little-endian bit
+    // order + accumulation order are preserved, so this is bit-exact vs the
+    // per-byte path while quartering the weight-load instruction count.
+    const device uint32_t* w32 = (const device uint32_t*)w;
+    for (int i = 0; i < (values_per_thread / 32); i++) {
+      uint32_t wb = w32[i];
+      const thread U* xt = x_thread + 32 * i;
+      for (int b = 0; b < 32; b++) {
+        accum += select(U(0), xt[b], bool((wb >> b) & 1u));
+      }
     }
   }
 
@@ -865,7 +866,7 @@ METAL_FUNC void qmv_fast_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  constexpr int packs_per_thread = bits <= 2 ? 1 : 2;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
