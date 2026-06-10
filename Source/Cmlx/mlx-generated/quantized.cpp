@@ -859,8 +859,14 @@ METAL_FUNC void qmv_quad_impl(
 // 1-bit (scale=2d, values ±d): bias = -scale/2. 2-bit ternary (scale=d,
 // values {-d,0,+d}): bias = -scale. Removes the bias stream (~10% of the
 // weight-stream bytes at 1-bit/g128); same ALU (sum_x is computed anyway).
-template <typename U, int bits>
+// bias_free is threaded through so the assert fires only when the symmetric
+// path is actually selected — the ternary at the call sites instantiates this
+// template for every bits value, including the affine-only widths.
+template <typename U, int bits, bool bias_free>
 METAL_FUNC U sym_derived_bias(U scale) {
+  static_assert(
+      !bias_free || bits == 1 || bits == 2,
+      "bias-free (symmetric) path is only defined for 1- and 2-bit formats");
   return bits == 1 ? U(-0.5f) * scale : -scale;
 }
 
@@ -876,7 +882,7 @@ METAL_FUNC void qmv_fast_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int packs_per_thread = bits <= 2 ? 1 : 2;
+  constexpr int packs_per_thread = bits <= 2 ? 1 : 2;  // mlx#3: 1-bit uses 1 pack/thread (vpt=32) for occupancy (~+11% decode)
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
@@ -915,7 +921,7 @@ METAL_FUNC void qmv_fast_impl(
       const device T* bl = biases + row * in_vec_size_g;
 
       U s = sl[0];
-      U b = bias_free ? sym_derived_bias<U, bits>(s) : (U)bl[0];
+      U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s) : (U)bl[0];
       result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
     }
 
@@ -942,7 +948,7 @@ METAL_FUNC void qmv_fast_impl(
       const device T* bl = biases + row * in_vec_size_g;
 
       U s = in_bounds ? (U)sl[0] : (U)0;
-      U b = bias_free ? sym_derived_bias<U, bits>(s)
+      U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s)
                       : (in_bounds ? (U)bl[0] : (U)0);
       result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
     }
@@ -1018,7 +1024,7 @@ METAL_FUNC void qmv_impl(
         const device T* bl = biases + row * in_vec_size_g;
 
         U s = sl[0];
-        U b = bias_free ? sym_derived_bias<U, bits>(s) : (U)bl[0];
+        U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s) : (U)bl[0];
         result[row] +=
             qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
       }
@@ -1044,7 +1050,7 @@ METAL_FUNC void qmv_impl(
         const device T* bl = biases + row * in_vec_size_g;
 
         U s = sl[0];
-        U b = bias_free ? sym_derived_bias<U, bits>(s) : (U)bl[0];
+        U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s) : (U)bl[0];
         result[row] += qdot_safe<U, values_per_thread, bits>(
             wl, x_thread, s, b, sum, remaining);
       }
@@ -1079,7 +1085,7 @@ METAL_FUNC void qmv_impl(
         const device T* bl = biases + row * in_vec_size_g;
 
         U s = sl[0];
-        U b = bias_free ? sym_derived_bias<U, bits>(s) : (U)bl[0];
+        U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s) : (U)bl[0];
         result[row] +=
             qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
       }
@@ -1103,7 +1109,7 @@ METAL_FUNC void qmv_impl(
         const device T* bl = biases + row * in_vec_size_g;
 
         U s = sl[0];
-        U b = bias_free ? sym_derived_bias<U, bits>(s) : (U)bl[0];
+        U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s) : (U)bl[0];
         result[row] += qdot_safe<U, values_per_thread, bits>(
             wl, x_thread, s, b, sum, remaining);
       }
