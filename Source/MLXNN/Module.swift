@@ -79,7 +79,7 @@ public typealias ModuleItem = NestedItem<String, ModuleValue>
 ///
 /// > Please read <doc:custom-layers> for more information about implementing custom layers
 /// including how to override the module and parameter keys and allowing dynamic updates of the
-/// module structure to occur via ``update(modules:verify:)``.
+/// module structure to occur via ``update(modules:verify:path:modulePath:)``.
 ///
 /// ### Training
 ///
@@ -106,12 +106,11 @@ open class Module {
     /// See ``noGrad()``
     private var _noGrad = Set<String>()
 
-    private var _items: ModuleItems!
-    private var _setters: [String: TypeErasedSetter]!
+    private var _items: ModuleItems?
+    private var _setters: [String: TypeErasedSetter]?
 
     /// Initializes the module.
     public init() {
-        buildCaches()
     }
 
     private func buildCaches() {
@@ -141,7 +140,13 @@ open class Module {
     ///
     /// Subclasses could potentially override this to provide custom introspection.
     open func items() -> ModuleItems {
-        _items
+        if _items == nil {
+            buildCaches()
+        }
+        guard let items = _items else {
+            fatalError("_items not set after buildCaches()")
+        }
+        return items
     }
 
     /// Describe extra parameters.
@@ -374,7 +379,7 @@ open class Module {
             isLeaf: Self.isLeafModuleNoChildren)
     }
 
-    /// Options for verifying ``update(parameters:verify:)`` and ``update(modules:verify:)``.
+    /// Options for verifying ``update(parameters:verify:path:modulePath:)`` and ``update(modules:verify:path:modulePath:)``.
     public struct VerifyUpdate: OptionSet, Sendable {
         public init(rawValue: Int) {
             self.rawValue = rawValue
@@ -393,7 +398,7 @@ open class Module {
         static public let none = VerifyUpdate([])
     }
 
-    /// A non-throwing version of ``update(parameters:verify:)``.
+    /// A non-throwing version of ``update(parameters:verify:path:modulePath:)``.
     ///
     /// This passes `verify: .none`.  Note that there may still be `fatalErrors()` if
     /// for example an `MLXArray` is set on a `Module`.
@@ -429,6 +434,8 @@ open class Module {
     ///   - parameters: replacement parameters in the same format that ``parameters()``
     ///     or ``mapParameters(map:isLeaf:)`` provides
     ///   - verify: options for verifying parameters
+    ///   - path: the key path used for error reporting during recursive updates
+    ///   - modulePath: the module type path used for error reporting during recursive updates
     ///
     /// ### See Also
     /// - <doc:custom-layers>
@@ -436,7 +443,7 @@ open class Module {
     /// - ``apply(filter:map:)``
     /// - ``parameters()``
     /// - ``mapParameters(map:isLeaf:)``
-    /// - ``update(modules:verify:)``
+    /// - ``update(modules:verify:path:modulePath:)``
     @discardableResult
     open func update(
         parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
@@ -582,7 +589,7 @@ open class Module {
         update(parameters: filterMap(filter: filter, map: Self.mapParameters(map: map)))
     }
 
-    /// A non-throwing version of ``update(modules:verify:)``.
+    /// A non-throwing version of ``update(modules:verify:path:modulePath:)``.
     ///
     /// This passes `verify: .none`.  Note that there may still be `fatalErrors()` if
     /// for example an `Module` is set on a `MLXArray`.
@@ -625,11 +632,13 @@ open class Module {
     /// - Parameters:
     ///   - modules: replacement modules in the same format as ``children()`` or ``leafModules()``
     ///   - verify: options for verifying parameters
+    ///   - path: the key path used for error reporting during recursive updates
+    ///   - modulePath: the module type path used for error reporting during recursive updates
     ///
     /// ### See Also
     /// - <doc:custom-layers>
     /// - ``update(modules:)``
-    /// - ``update(parameters:verify:)``
+    /// - ``update(parameters:verify:path:modulePath:)``
     /// - ``children()``
     /// - ``leafModules()``
     /// - ``QuantizedLinear/quantize(model:groupSize:bits:predicate:)``
@@ -782,7 +791,11 @@ open class Module {
     ///   - key: module key, see ``ModuleInfo``
     ///   - value: the replacement module
     open func updateModule(key: String, _ value: Any) throws {
-        if let setter = _setters[key] {
+        if _setters == nil {
+            buildCaches()
+        }
+
+        if let setter = _setters?[key] {
             do {
                 try setter.updateModule(value)
             } catch {
@@ -1445,7 +1458,7 @@ private protocol TypeErasedSetterProvider {
 }
 
 /// ModuleInfo can provde information about child modules and act as an
-/// update point for ``Module/update(modules:verify:)``.
+/// update point for ``Module/update(modules:verify:path:modulePath:)``.
 ///
 /// The keys for modules and parameters are usually named after their instance variables,
 /// but `feed_forward` would not be a very Swifty variable name:
@@ -1494,7 +1507,7 @@ private protocol TypeErasedSetterProvider {
 ///     }
 /// ```
 ///
-/// The `ModuleInfo` provides a hook for ``QuantizedLinear`` and ``Module/update(modules:verify:)`` /// to
+/// The `ModuleInfo` provides a hook for ``QuantizedLinear`` and ``Module/update(modules:verify:path:modulePath:)`` to
 /// replace the contents of `w1`, etc. with a new compatible `Model` after it is created.
 ///
 /// ### See Also
