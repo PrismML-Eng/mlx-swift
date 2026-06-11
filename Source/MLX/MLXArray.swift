@@ -602,7 +602,7 @@ public final class MLXArray {
     /// update values.
     ///
     /// ### See Also
-    /// - ``subscript(indices:stream:)``
+    /// - ``ArrayAt``
     /// - ``ArrayAtIndices``
     public var at: ArrayAt { ArrayAt(array: self) }
 }
@@ -616,8 +616,10 @@ extension MLXArray: Updatable, Evaluatable {
 extension MLXArray: CustomStringConvertible {
     public var description: String {
         var s = mlx_string_new()
-        mlx_array_tostring(&s, ctx)
         defer { mlx_string_free(s) }
+        _ = evalLock.withLock {
+            mlx_array_tostring(&s, ctx)
+        }
         return String(cString: mlx_string_data(s), encoding: .utf8)!
     }
 }
