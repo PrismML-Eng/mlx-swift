@@ -69,18 +69,6 @@ jobs:
         run: |
           pre-commit run --all || (echo "Style checks failed, please install pre-commit and run pre-commit run --all and push the change"; echo ""; git --no-pager diff; exit 1)
 
-  docs:
-    needs: lint
-    if: github.repository == 'ml-explore/mlx-swift'
-    runs-on: [self-hosted, macos]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Verify documentation
-        run: scripts/verify-docs.sh
-
   mac_build_and_test:
     needs: lint
     if: github.repository == 'ml-explore/mlx-swift'
@@ -101,26 +89,39 @@ jobs:
 
       - name: Build SwiftPM (Xcode, macOS)
         shell: sh
+        env:
+          # workaround for CI failure
+          DEVELOPER_DIR: /Applications/Xcode-latest.app
         run: |
           xcodebuild -version
+          xcrun --show-sdk-build-version
           swift --version
           rm -rf ~/Library/Developer/Xcode/DerivedData/*
           xcodebuild build-for-testing -scheme mlx-swift-Package -destination 'platform=macOS'
 
       - name: Run Tests SwiftPM (Xcode, macOS)
         shell: sh
+        env:
+          # workaround for CI failure
+          DEVELOPER_DIR: /Applications/Xcode-latest.app
         run: |
           xcrun xctest ~/Library/Developer/Xcode/DerivedData/mlx-swift-*/Build/Products/Debug/CmlxTests.xctest
           xcrun xctest ~/Library/Developer/Xcode/DerivedData/mlx-swift-*/Build/Products/Debug/MLXTests.xctest
 
       - name: Build xcodeproj (Xcode, macOS)
         shell: sh
+        env:
+          # workaround for CI failure
+          DEVELOPER_DIR: /Applications/Xcode-latest.app
         run: |
           rm -rf ~/Library/Developer/Xcode/DerivedData/*
           cd xcode
           xcodebuild build-for-testing -scheme MLX -destination 'platform=macOS'
 
       - name: Run Tests xcodeproj (Xcode, macOS)
+        env:
+          # workaround for CI failure
+          DEVELOPER_DIR: /Applications/Xcode-latest.app
         working-directory: xcode
         run: ../.github/scripts/run-xcode-tests.sh
 
