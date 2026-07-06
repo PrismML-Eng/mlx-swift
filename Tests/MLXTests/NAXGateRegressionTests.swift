@@ -16,7 +16,7 @@ import XCTest
 
 class NAXGateRegressionTests: XCTestCase {
 
-    override func setUp() {
+    override class func setUp() {
         setDefaultDevice()
     }
 
