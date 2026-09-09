@@ -46,3 +46,11 @@ These can be used with ``Sequential``.
 
 - ``Bilinear``
 - ``MultiHeadAttention``
+
+### Hadamard Quantization
+
+- ``SignedBlockHadamard``
+- ``PrismHadamardConfiguration``
+- ``HadamardQuantizedLinear``
+- ``HadamardQuantizedEmbedding``
+- ``HadamardGDNLayout``
