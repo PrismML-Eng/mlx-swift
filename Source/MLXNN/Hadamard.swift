@@ -125,7 +125,7 @@ private func validateHadamardWeights(
     _ weight: MLXArray, scales: MLXArray, biases: MLXArray?,
     groupSize: Int, bits: Int, transform: SignedBlockHadamard
 ) throws {
-    guard [1, 2, 4, 8].contains(bits), [32, 64, 128].contains(groupSize),
+    guard [1, 2, 3, 4, 5, 6, 8].contains(bits), [32, 64, 128].contains(groupSize),
         weight.ndim == 2, weight.dtype == .uint32,
         weight.dim(0) > 0, weight.dim(1) == transform.width / 32 * bits,
         transform.width % 32 == 0, transform.width % groupSize == 0,

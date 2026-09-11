@@ -125,4 +125,30 @@ class HadamardLayerTests: XCTestCase {
                 weight: MLXArray.zeros([2, 8]), scales: MLXArray.ones([2, 1]), biases: nil,
                 groupSize: 128, bits: 2, transform: transform))
     }
+
+    /// The bundled quantized kernels support {1, 2, 3, 4, 5, 6, 8}, so the layer
+    /// initializers must accept the non-power-of-two widths too. The packed width
+    /// `width / 32 * bits` is the exact MLX affine layout for every one of them.
+    func testAcceptsEveryKernelSupportedBitWidth() throws {
+        let width = 512
+        let transform = try SignedBlockHadamard(
+            blockSize: 128, signs: (0 ..< width).map { $0 % 3 == 0 ? -1 : 1 })
+        let weights = MLXArray(
+            (0 ..< 4 * width).map { Float(($0 * 13) % 31 - 15) / 16 }, [4, width])
+        for bits in [1, 2, 3, 4, 5, 6, 8] {
+            let (packed, scales, biases) = quantized(weights, groupSize: 128, bits: bits)
+            XCTAssertEqual(packed.dim(1), width / 32 * bits, "packed width for \(bits) bits")
+            let linear = try HadamardQuantizedLinear(
+                weight: packed, scales: scales, biases: biases,
+                groupSize: 128, bits: bits, transform: transform)
+            let unfolded = transform.inverse(
+                dequantized(packed, scales: scales, biases: biases, groupSize: 128, bits: bits))
+            let input = weights[0 ..< 2]
+            let reference = input.matmul(unfolded.T)
+            let difference = linear(input) - reference
+            let relative =
+                (difference * difference).sum().sqrt() / (reference * reference).sum().sqrt()
+            XCTAssertLessThan(relative.item(Float.self), 1e-4, "bits \(bits)")
+        }
+    }
 }
