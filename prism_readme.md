@@ -1,95 +1,69 @@
-# MLX-Swift with 1-Bit Quantization Support
+# Hadamard quantization in MLXNN
 
-This fork of [mlx-swift](https://github.com/ml-explore/mlx-swift) adds native 1-bit weight quantization, enabling any MLX 1-bit model to run efficiently on iPhone and iPad at significantly reduced memory footprints.
+`MLXNN` provides `SignedBlockHadamard`, `PrismHadamardConfiguration`,
+`HadamardQuantizedLinear`, `HadamardQuantizedEmbedding`, and `HadamardGDNLayout`.
+The layers extend the official release API without changing existing layer behavior.
 
-## Quick Start
-
-### Option A: Swift Package Dependency
-
-Add this fork as a dependency (replacing the standard mlx-swift URL):
+Decode extracted version-1 `prism.hadamard.*` metadata and construct a layer from
+MLX affine packed arrays without requantizing:
 
 ```swift
-// Package.swift
-dependencies: [
-    .package(url: "https://github.com/PrismML-Eng/mlx-swift.git", branch: "prism"),
-]
+import Foundation
+import MLX
+import MLXNN
+
+let configuration = try JSONDecoder().decode(
+    PrismHadamardConfiguration.self, from: metadataJSON)
+let transform = try configuration.transform(forWidth: inputWidth)
+let projection = try HadamardQuantizedLinear(
+    weight: packedWeight, scales: scales, biases: quantizationBiases,
+    groupSize: 128, bits: 2, transform: transform)
+let output = projection(activations)
 ```
 
-No changes are needed in your model loading code. If a model's `config.json` specifies `"bits": 1`, the 1-bit kernels are dispatched automatically through `QuantizedLinear`.
+`metadataJSON` is the extracted metadata object, not a GGUF file. `packedWeight`
+is a uint32 MLX matrix. Raw PQ2/PTQ1/Q2 GGUF blocks require conversion before they
+can be supplied here. The initializer validates packed dimensions and scale/bias
+shapes. Malformed signs, unsupported transform conventions, and unknown sign
+widths throw errors during configuration loading.
 
-### Option B: Build from Source
+`HadamardQuantizedEmbedding` accepts the same packed-weight arguments and applies
+the inverse transform after lookup. Its `asLinear` method applies the forward
+transform for tied output weights. Both layer types conform to `Quantized`, so
+`quantizeSingle` does not quantize them again. Transform signs are immutable
+configuration rather than trainable parameters. Save the metadata alongside
+parameter arrays when saving a checkpoint.
 
-```bash
-git clone https://github.com/PrismML-Eng/mlx-swift.git
-cd mlx-swift
-git checkout prism
-git submodule update --init
+When the model's GDN produces tiled values and `configuration.gdnVGrouped` is
+true, pass `HadamardGDNLayout(width:keyHeads:valueHeads:)` as the linear layer's
+`gdnLayout` argument for the GDN output projection. It permutes tiled values to
+grouped values before applying signs and Hadamard. Do not enable it when GDN
+already produces grouped values or on unrelated projections. Tensor-to-module
+mapping and the upstream GDN layout remain the model loader's responsibility.
+
+### Validation
+
+Metal tests on M5 Pro with Xcode 26.6 cover block sizes 512/1024/2048/4096 at ten
+compatible model-width pairs, row counts 1/8/64, and 1/2-bit affine matmul through
+the production layer. They compare against independent scalar butterflies.
+Additional tests cover embedding lookup, tied projection, FP32/FP16/BF16,
+grouped GDN ordering, invalid metadata and packed shapes, and existing NAX and
+quantization regressions. This is runtime/layer validation; real-model generation
+and raw GGUF loading are not established by these tests.
+
+## Release dependency
+
+Use the fork's `v0.31.6_prism` branch for the release-based runtime:
+
+```swift
+.package(url: "https://github.com/PrismML-Eng/mlx-swift.git", branch: "v0.31.6_prism")
 ```
 
-Apply patches (needed until upstreamed):
+A version requirement such as `from: "0.31.6"` resolves version tags rather than
+this branch. Keep the resolved dependency file to record tested revisions.
+Ordinary builds use the checked-in generated sources and require no manual
+patch application. For a source checkout, initialize submodules recursively.
 
-```bash
-cd Source/Cmlx/mlx
-git apply ../../../patches/mlx-quantized-dispatch-1bit.patch
-cd ../../..
-
-cd Source/Cmlx/mlx-c
-git apply ../../../patches/mlx-c-global-scale-nullopt.patch
-cd ../../..
-```
-
-Regenerate Metal shaders and build:
-
-```bash
-./tools/update-mlx.sh
-swift build
-```
-
-## Quantization Format
-
-| Property | Value |
-|----------|-------|
-| Bits per weight | 1 (packed into uint32, 32 values per word) |
-| Group size | 32, 64, or 128 |
-| Per-group parameters | fp16 `scale` + fp16 `bias` |
-| Effective storage | ~1.1–1.5 bits/weight (depending on group size) |
-| Dequantization | `w = scale * bit + bias` |
-
-Models use SafeTensors format with `config.json` containing:
-```json
-{"quantization": {"bits": 1, "group_size": 128}}
-```
-
-## Related Repositories
-
-- [PrismML-Eng/mlx](https://github.com/PrismML-Eng/mlx/tree/prism) — MLX C++ core with 1-bit kernel support
-- [ml-explore/mlx-swift](https://github.com/ml-explore/mlx-swift) — Upstream mlx-swift
-- [ml-explore/mlx](https://github.com/ml-explore/mlx) — Upstream MLX framework
-
----
-
-## Appendix
-
-### What Changed
-
-#### MLX C++ core (submodule: `Source/Cmlx/mlx`)
-
-The mlx submodule points to [PrismML-Eng/mlx](https://github.com/PrismML-Eng/mlx/tree/prism) which adds:
-
-- **Validation** (`ops.cpp`): Accepts `bits=1` in quantize/dequantize operations
-- **Metal kernels** (`quantized.h`, `quantized_nax.h`): 1-bit `load_vector`, `qdot`, `qouter`, `dequantize` using bit extraction and `select()` intrinsics
-- **Kernel instantiation** (`quantized.metal`): `instantiate_quantized_groups(1)` for all group sizes
-- **CPU backend** (`cpu/quantized.cpp`): 1-bit dequantization path
-
-#### Patches (applied on top of submodules)
-
-| Patch | File | Change |
-|-------|------|--------|
-| `mlx-quantized-dispatch-1bit.patch` | `mlx/backend/metal/quantized.cpp` | Guards fast-path kernel dispatch for 1-bit on mobile Metal GPUs. (2 lines) |
-| `mlx-c-global-scale-nullopt.patch` | `mlx-c/mlx/c/ops.cpp` | Passes `std::nullopt` for new `global_scale` parameters in `quantize`, `dequantize`, and `qqmm` C bindings. (4 lines) |
-
-#### MLX-Swift level
-
-- **`tools/update-mlx.sh`**: Added `steel_conv_3d` build target (required after merging upstream mlx changes)
-- **`.gitmodules`**: Points mlx submodule to the 1-bit fork
-- **`Source/Cmlx/mlx-generated/`**: Regenerated Metal shaders with 1-bit support
+The core pin includes the release backport of the generation-18 NAX guard. Its
+source guard agrees with the checked-in flattened header, so regeneration
+preserves the guard.
