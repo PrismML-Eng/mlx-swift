@@ -26,18 +26,6 @@ git checkout prism
 git submodule update --init
 ```
 
-Apply patches (needed until upstreamed):
-
-```bash
-cd Source/Cmlx/mlx
-git apply ../../../patches/mlx-quantized-dispatch-1bit.patch
-cd ../../..
-
-cd Source/Cmlx/mlx-c
-git apply ../../../patches/mlx-c-global-scale-nullopt.patch
-cd ../../..
-```
-
 Regenerate Metal shaders and build:
 
 ```bash
@@ -81,15 +69,26 @@ The mlx submodule points to [PrismML-Eng/mlx](https://github.com/PrismML-Eng/mlx
 - **Kernel instantiation** (`quantized.metal`): `instantiate_quantized_groups(1)` for all group sizes
 - **CPU backend** (`cpu/quantized.cpp`): 1-bit dequantization path
 
-#### Patches (applied on top of submodules)
-
-| Patch | File | Change |
-|-------|------|--------|
-| `mlx-quantized-dispatch-1bit.patch` | `mlx/backend/metal/quantized.cpp` | Guards fast-path kernel dispatch for 1-bit on mobile Metal GPUs. (2 lines) |
-| `mlx-c-global-scale-nullopt.patch` | `mlx-c/mlx/c/ops.cpp` | Passes `std::nullopt` for new `global_scale` parameters in `quantize`, `dequantize`, and `qqmm` C bindings. (4 lines) |
-
 #### MLX-Swift level
 
-- **`tools/update-mlx.sh`**: Added `steel_conv_3d` build target (required after merging upstream mlx changes)
+- **`tools/update-mlx.sh`**: Regenerates Metal sources and headers from the pinned core and C bindings
 - **`.gitmodules`**: Points mlx submodule to the 1-bit fork
 - **`Source/Cmlx/mlx-generated/`**: Regenerated Metal shaders with 1-bit support
+
+## Hadamard-folded Bonsai 2 checkpoints
+
+`MLXNN` provides `SignedBlockHadamard`, `HadamardQuantizedLinear`, and
+`HadamardQuantizedEmbedding`. The transform applies explicit signs across the
+full input width, accumulates in FP32, and restores the activation dtype.
+Embedding lookup applies the inverse transform; tied output projection applies
+the forward transform.
+
+A `prism_hadamard_qwen35` checkpoint also needs model-loader support in
+`mlx-swift-lm`. The runtime dependency alone does not register its model type or
+install its transformed layers. The loader must validate the checkpoint's module
+manifest and install the declared layers before strict weight loading. Loading
+these tensors as ordinary quantized layers produces incorrect outputs.
+
+The integration covers the published Qwen3.5-compatible Bonsai 2 27B artifact:
+2-bit affine weights, group size 128, FP16 activations, and explicit signed
+Hadamard blocks. It does not convert or rewrite the checkpoint.

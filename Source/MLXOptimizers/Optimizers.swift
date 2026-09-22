@@ -9,10 +9,85 @@ import MLXNN
 /// ### See Also
 /// - <doc:MLXOptimizers>
 /// - ``OptimizerBase``
+// Note on scalar precision: these optimizers store their hyperparameters as `Float`
+// while python stores them as double, so coefficients derived from them differ in
+// the last bits -- `1 - Float(0.95)` is 0.050000012, while python's `1 - 0.95`
+// rounds to 0.05.  Widening at the point of use (`1 - Double(momentum)`) cannot
+// recover python's value: the constant was already rounded when it was stored.
+//
+// The 2.4e-7 difference is invisible in the smooth optimizers, but Muon's
+// Newton-Schulz iteration grows it to ~2e-4 relative over a few steps, which is why
+// the generated `Muon` cases compare with a looser tolerance than the rest.  See
+// `todos/muon-04-pending-p3-float-hyperparameters.md`.
+
 public protocol Optimizer: Updatable, Evaluatable {
 
     /// Apply the gradients to the parameters of the model and update the model with the new parameters.
     func update(model: Module, gradients: ModuleParameters)
+}
+
+/// An optimizer that delegates to several sub-optimizers, routing each parameter to the first
+/// optimizer whose filter matches.
+///
+/// This makes it easy to use different optimizers (or different hyperparameters) for different
+/// weights. The `filters` are predicates over a parameter's flattened key path and its gradient
+/// and must be one fewer than `optimizers` -- the last optimizer is the fallback and receives
+/// every parameter not matched by an earlier filter.
+///
+/// ```swift
+/// // Adam for everything except biases, which use SGD.
+/// let optimizer = MultiOptimizer(
+///     optimizers: [SGD(learningRate: 0.1), Adam(learningRate: 1e-3)],
+///     filters: [{ key, _ in key.hasSuffix(".bias") }])
+/// ```
+///
+/// This is a port of Python `mlx.optimizers.MultiOptimizer`.
+///
+/// ### See Also
+/// - <doc:MLXOptimizers>
+open class MultiOptimizer: Optimizer {
+
+    /// The sub-optimizers; the last one is the fallback for unmatched parameters.
+    public let optimizers: [Optimizer]
+
+    /// Predicates over `(key, gradient)`, one per optimizer. The provided filters select the first
+    /// `optimizers.count - 1`; the last is an implicit always-true fallback.
+    private let filters: [(String, MLXArray) -> Bool]
+
+    /// - Parameters:
+    ///   - optimizers: the optimizers to delegate to (at least one)
+    ///   - filters: predicates selecting which parameters route to each optimizer; there must be
+    ///     `optimizers.count - 1` of them (the last optimizer is the unconditioned fallback)
+    public init(optimizers: [Optimizer], filters: [(String, MLXArray) -> Bool] = []) {
+        precondition(!optimizers.isEmpty, "MultiOptimizer requires at least one optimizer")
+        precondition(
+            filters.count == optimizers.count - 1,
+            "MultiOptimizer given \(filters.count) filters but \(optimizers.count - 1) needed")
+        self.optimizers = optimizers
+        self.filters = filters + [{ _, _ in true }]
+    }
+
+    /// Partition the flattened gradients into one group per optimizer, by first matching filter.
+    private func split(_ gradients: ModuleParameters) -> [[(String, MLXArray)]] {
+        var parts = Array(repeating: [(String, MLXArray)](), count: optimizers.count)
+        for (key, gradient) in gradients.flattened() {
+            for (i, filter) in filters.enumerated() where filter(key, gradient) {
+                parts[i].append((key, gradient))
+                break
+            }
+        }
+        return parts
+    }
+
+    public func update(model: Module, gradients: ModuleParameters) {
+        for (optimizer, part) in zip(optimizers, split(gradients)) where !part.isEmpty {
+            optimizer.update(model: model, gradients: ModuleParameters.unflattened(part))
+        }
+    }
+
+    public func innerState() -> [MLXArray] {
+        optimizers.flatMap { $0.innerState() }
+    }
 }
 
 /// The base class for all optimizers. It allows us to implement an optimizer on a per-parameter basis
@@ -497,17 +572,17 @@ open class Lion: OptimizerBaseArrayState {
 
     /// The learning rate
     public var learningRate: Float
-    /// The coefficients used for computing running averages of the gradient and its square
-    public var betas: (Float, Float) = (0.9, 0.999)
+    /// The coefficients used for computing the gradient momentum and update direction
+    public var betas: (Float, Float) = (0.9, 0.99)
     /// The weight decay
     public var weightDecay: Float = 0.0
 
     /// Initialize the optimizer.
     /// - Parameters:
     ///   - learningRate: the learning rate
-    ///   - betas: coefficients used for computing running averages of the gradient and its square
+    ///   - betas: coefficients used for computing the gradient momentum and update direction
     ///   - weightDecay:the weight decay
-    public init(learningRate: Float, betas: (Float, Float) = (0.9, 0.999), weightDecay: Float = 0.0)
+    public init(learningRate: Float, betas: (Float, Float) = (0.9, 0.99), weightDecay: Float = 0.0)
     {
         self.learningRate = learningRate
         self.betas = betas
@@ -646,7 +721,9 @@ open class Adafactor: OptimizerBase<Adafactor.State> {
     func approvateExpMovingAverage(expAvgSqRow: MLXArray, expAvgSqCol: MLXArray) -> MLXArray {
         let rFactor = rsqrt(expAvgSqRow / mean(expAvgSqRow, axis: -1, keepDims: true))
         let cFactor = rsqrt(expAvgSqCol)
-        return matmul(rFactor.expandedDimensions(axis: -1), cFactor.expandedDimensions(axis: 0))
+        // broadcast rather than matmul so this also works for parameters with more
+        // than two dimensions
+        return rFactor.expandedDimensions(axis: -1) * cFactor.expandedDimensions(axis: -2)
     }
 
     override open func applySingle(gradient: MLXArray, parameter: MLXArray, state: State) -> (
@@ -666,8 +743,15 @@ open class Adafactor: OptimizerBase<Adafactor.State> {
         var update = square(gradient) + eps.0
 
         if factored {
-            var expAvgSqRow = state.expAvgSqRow!
-            var expAvgSqCol = state.expAvgSqCol!
+            // the state is created from the gradient shape so that it always agrees
+            // with the branch taken here, even if a parameter's rank changed
+            let rowShape = Array(gradientShape.dropLast())
+            let columnShape = Array(gradientShape.dropLast(2)) + [gradientShape.last!]
+
+            var expAvgSqRow =
+                state.expAvgSqRow ?? MLXArray.zeros(rowShape, dtype: gradient.dtype)
+            var expAvgSqCol =
+                state.expAvgSqCol ?? MLXArray.zeros(columnShape, dtype: gradient.dtype)
 
             expAvgSqRow = (beta2 * expAvgSqRow) + (1 - beta2) * mean(update, axis: -1)
             expAvgSqCol = (beta2 * expAvgSqCol) + (1 - beta2) * mean(update, axis: -2)
@@ -678,7 +762,7 @@ open class Adafactor: OptimizerBase<Adafactor.State> {
             update = approvateExpMovingAverage(expAvgSqRow: expAvgSqRow, expAvgSqCol: expAvgSqCol)
             update = update * gradient
         } else {
-            var expAvgSq = state.expAvgSq!
+            var expAvgSq = state.expAvgSq ?? MLXArray.zeros(like: gradient)
             expAvgSq = (beta2 * expAvgSq) + (1 - beta2) * update
             state.expAvgSq = expAvgSq
             update = rsqrt(expAvgSq) * gradient
@@ -688,7 +772,7 @@ open class Adafactor: OptimizerBase<Adafactor.State> {
         update = learningRate * update
 
         if let beta1 {
-            var expAvg = state.expAvg!
+            var expAvg = state.expAvg ?? MLXArray.zeros(like: gradient)
             expAvg = (beta1 * expAvg) + (1 - beta1) * update
             state.expAvg = expAvg
             update = expAvg
@@ -700,6 +784,101 @@ open class Adafactor: OptimizerBase<Adafactor.State> {
         }
 
         return (parameter - update, state)
+    }
+}
+
+/// The Muon (MomentUm Orthogonalized by Newton-schulz) optimizer.
+///
+/// Follows the original implementation: [Muon: An optimizer for hidden layers in
+/// neural networks](https://kellerjordan.github.io/posts/muon/).
+///
+/// - Note: Muon may be sub-optimal for the embedding layer, the final fully
+///   connected layer, or any 0D/1D parameters; optimize those with a different
+///   method (e.g. ``AdamW``). For parameters with more than 2 dimensions (e.g. 4D
+///   convolution filters) the trailing dimensions are flattened.
+///
+/// ### See Also
+/// - <doc:MLXOptimizers>
+open class Muon: OptimizerBaseArrayState {
+
+    /// The learning rate
+    public var learningRate: Float
+    /// The momentum strength
+    public var momentum: Float = 0.95
+    /// The weight decay (L2 penalty)
+    public var weightDecay: Float = 0.01
+    /// Enables Nesterov momentum (recommended)
+    public var nesterov = true
+    /// Number of Newton-Schulz iteration steps for orthogonalization
+    public var nsSteps: Int = 5
+
+    /// Initialize the optimizer.
+    /// - Parameters:
+    ///   - learningRate: the learning rate
+    ///   - momentum: the momentum strength
+    ///   - weightDecay: the weight decay (L2 penalty)
+    ///   - nesterov: enables Nesterov momentum
+    ///   - nsSteps: number of Newton-Schulz iteration steps
+    public init(
+        learningRate: Float, momentum: Float = 0.95, weightDecay: Float = 0.01,
+        nesterov: Bool = true, nsSteps: Int = 5
+    ) {
+        self.learningRate = learningRate
+        self.momentum = momentum
+        self.weightDecay = weightDecay
+        self.nesterov = nesterov
+        self.nsSteps = nsSteps
+    }
+
+    /// Orthogonalize a 2D matrix via a quintic Newton-Schulz iteration.
+    func zeropowerViaNewtonSchulz5(_ input: MLXArray, steps: Int) -> MLXArray {
+        precondition(input.ndim == 2, "Newton-Schulz iteration expects a 2D array")
+        let (a, b, c): (Float, Float, Float) = (3.4445, -4.7750, 2.0315)
+        let transposeNeeded = input.dim(-2) > input.dim(-1)
+
+        var X = transposeNeeded ? input.transposed(1, 0) : input
+        // Frobenius-normalize so the iteration converges.
+        X = X / (MLX.norm(X, keepDims: true) + 1e-7)
+
+        for _ in 0 ..< steps {
+            let A = matmul(X, X.transposed(1, 0))
+            let B = addMM(b * A, A, A, alpha: c, beta: 1.0)
+            X = addMM(a * X, B, X, alpha: 1.0, beta: 1.0)
+        }
+
+        return transposeNeeded ? X.transposed(1, 0) : X
+    }
+
+    override open func applySingle(gradient: MLXArray, parameter: MLXArray, state: MLXArray) -> (
+        MLXArray, MLXArray
+    ) {
+        var gradient = gradient
+        if weightDecay != 0 {
+            gradient = gradient + weightDecay * parameter
+        }
+
+        let v = momentum * state + (1 - momentum) * gradient
+
+        var update = nesterov ? (gradient * (1 - momentum) + v * momentum) : v
+        var lr = learningRate
+
+        if update.ndim >= 2 {
+            let originalShape = update.shape
+            let reshapeNeeded = update.ndim > 2
+            if reshapeNeeded {
+                update = update.reshaped([update.dim(0), -1])
+            }
+            update = zeropowerViaNewtonSchulz5(update, steps: nsSteps)
+            if reshapeNeeded {
+                update = update.reshaped(originalShape)
+            }
+            // Scale the learning rate by sqrt(max(1, rows / cols)).
+            let rows = Float(update.dim(-2))
+            let cols = Float(update.dim(-1))
+            lr *= pow(max(1, rows / cols), 0.5)
+        }
+
+        return (parameter - lr * update, v)
     }
 }
 
