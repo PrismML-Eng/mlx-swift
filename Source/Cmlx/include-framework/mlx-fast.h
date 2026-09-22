@@ -7,6 +7,7 @@
 #include <variant>
 
 #include <Cmlx/mlx-api.h>
+#include <Cmlx/mlx-backend-common-metal_kernel.h>
 #include <Cmlx/mlx-utils.h>
 
 namespace mlx::core::fast {
@@ -23,6 +24,10 @@ MLX_API array layer_norm(
     const std::optional<array>& bias,
     float eps,
     StreamOrDevice s = {});
+
+/** Fused cross entropy with class indices as targets. */
+MLX_API array
+cross_entropy(const array& logits, const array& targets, StreamOrDevice s = {});
 
 MLX_API array rope(
     const array& x,
@@ -53,6 +58,17 @@ MLX_API array scaled_dot_product_attention(
     const std::string& mask_mode = "",
     std::optional<array> mask_arr = {},
     const std::optional<array>& sinks = {},
+    bool force_fused = false,
+    StreamOrDevice s = {});
+
+MLX_API std::vector<array> gated_delta_update(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const array& gates,
+    const array& beta_,
+    const std::optional<array>& initial_state = std::nullopt,
+    const std::optional<array>& mask = std::nullopt,
     StreamOrDevice s = {});
 
 using TemplateArg = std::variant<int, bool, Dtype>;
@@ -76,7 +92,8 @@ MLX_API CustomKernelFunction metal_kernel(
     const std::string& source,
     const std::string& header = "",
     bool ensure_row_contiguous = true,
-    bool atomic_outputs = false);
+    bool atomic_outputs = false,
+    const CompileOptions& compile_options = {});
 
 MLX_API CustomKernelFunction cuda_kernel(
     const std::string& name,
@@ -99,6 +116,19 @@ MLX_API std::vector<array> precompiled_cuda_kernel(
     int shared_memory = 0,
     std::optional<float> init_value = std::nullopt,
     bool ensure_row_contiguous = false,
+    StreamOrDevice s = {});
+
+/** Fused greedy speculative-decoding verify.
+ *
+ * draft_tokens:  int32 [B, K]         — the K drafted tokens
+ * target_logits: floating [B, K+1, V] — target logits over [last] + draft
+ *
+ * Returns {n_accepted [B] int32, committed [B, K+1] int32}: the longest matching
+ * greedy prefix length, and (accepted draft prefix ++ corrected token). v1 is
+ * greedy only (temperature == 0); the caller prepends the seed `last` token. */
+MLX_API std::vector<array> spec_decode_verify(
+    const array& draft_tokens,
+    const array& target_logits,
     StreamOrDevice s = {});
 
 } // namespace mlx::core::fast

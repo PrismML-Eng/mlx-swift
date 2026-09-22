@@ -16,7 +16,6 @@ final class SaveTests: XCTestCase {
     )
 
     override func setUpWithError() throws {
-        setDefaultDevice()
         try FileManager.default.createDirectory(
             at: temporaryPath,
             withIntermediateDirectories: false
@@ -94,6 +93,22 @@ final class SaveTests: XCTestCase {
         assertEqual(try XCTUnwrap(loadedArrays["foo"]), try XCTUnwrap(arrays["foo"]))
         assertEqual(try XCTUnwrap(loadedArrays["bar"]), try XCTUnwrap(arrays["bar"]))
         XCTAssertEqual(loadedMetadata, metadata)
+    }
+
+    /// `loadArrays(data:)` seeks to the end to size its input, so the in-memory IO
+    /// stream has to report the size of the whole buffer rather than an offset
+    /// relative to the read position.
+    public func testLoadFromDataLargerThanHeader() throws {
+        // enough data that a SEEK_END mistake shows up as a truncated size
+        let arrays: [String: MLXArray] = [
+            "big": MLX.ones([64, 64])
+        ]
+
+        let data = try saveToData(arrays: arrays)
+        XCTAssertGreaterThan(data.count, 8)
+
+        let loaded = try loadArrays(data: data)
+        assertEqual(try XCTUnwrap(loaded["big"]), try XCTUnwrap(arrays["big"]))
     }
 
 }

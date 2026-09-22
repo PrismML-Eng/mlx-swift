@@ -36,7 +36,7 @@ public func save(array: MLXArray, url: URL, stream: StreamOrDevice = .default) t
     switch url.pathExtension {
     case "npy":
         _ = try withError {
-            _ = evalLock.withLock {
+            _ = withEvalLock {
                 mlx_save(path.cString(using: .utf8), array.ctx)
             }
         }
@@ -74,7 +74,7 @@ public func save(
     switch url.pathExtension {
     case "safetensors":
         _ = try withError {
-            _ = evalLock.withLock {
+            _ = withEvalLock {
                 mlx_save_safetensors(path.cString(using: .utf8), mlx_arrays, mlx_metadata)
             }
         }
@@ -214,7 +214,9 @@ private func new_mlx_io_vtable_dataIO() -> mlx_io_vtable {
         case SEEK_CUR:
             state.offset += Int(offset)
         case SEEK_END:
-            state.offset = state.offset - Int(offset)
+            // offset is relative to the end of the data, not the current position.
+            // mlx's load_safetensors uses seek(0, end) + tell() to size the input.
+            state.offset = state.data.count + Int(offset)
         default:
             break
         }
@@ -288,7 +290,7 @@ public func saveToData(
     defer { mlx_io_writer_free(writer) }
 
     _ = try withError {
-        _ = evalLock.withLock {
+        _ = withEvalLock {
             mlx_save_safetensors_writer(writer, mlx_arrays, mlx_metadata)
         }
     }

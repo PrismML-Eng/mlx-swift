@@ -37,10 +37,10 @@ typedef struct mlx_io_vtable_ {
   bool (*is_open)(void*);
   bool (*good)(void*);
   size_t (*tell)(void*);
-  void (*seek)(void*, int64_t off, int whence);
-  void (*read)(void*, char* data, size_t n);
-  void (*read_at_offset)(void*, char* data, size_t n, size_t off);
-  void (*write)(void*, const char* data, size_t n);
+  int (*seek)(void*, int64_t off, int whence);
+  size_t (*read)(void*, char* data, size_t n);
+  size_t (*read_at_offset)(void*, char* data, size_t n, size_t off);
+  size_t (*write)(void*, const char* data, size_t n);
   const char* (*label)(void*);
   void (*free)(void*);
 } mlx_io_vtable;
@@ -94,6 +94,52 @@ int mlx_io_writer_tostring(mlx_string* str_, mlx_io_writer io);
  * will be called when the underlying object is actually freed.
  */
 int mlx_io_writer_free(mlx_io_writer io);
+
+/**
+ * A MLX GGUF object.
+ */
+typedef struct mlx_io_gguf_ {
+  void* ctx;
+} mlx_io_gguf;
+
+mlx_io_gguf mlx_io_gguf_new(void);
+int mlx_io_gguf_free(mlx_io_gguf io);
+int mlx_io_gguf_get_keys(mlx_vector_string* keys, mlx_io_gguf io);
+int mlx_io_gguf_get_array(mlx_array* arr, mlx_io_gguf io, const char* key);
+int mlx_io_gguf_get_metadata_array(
+    mlx_array* arr,
+    mlx_io_gguf io,
+    const char* key);
+int mlx_io_gguf_get_metadata_string(
+    mlx_string* str,
+    mlx_io_gguf io,
+    const char* key);
+int mlx_io_gguf_get_metadata_vector_string(
+    mlx_vector_string* vstr,
+    mlx_io_gguf io,
+    const char* key);
+int mlx_io_gguf_has_metadata_array(bool* flag, mlx_io_gguf io, const char* key);
+int mlx_io_gguf_has_metadata_string(
+    bool* flag,
+    mlx_io_gguf io,
+    const char* key);
+int mlx_io_gguf_has_metadata_vector_string(
+    bool* flag,
+    mlx_io_gguf io,
+    const char* key);
+int mlx_io_gguf_set_array(mlx_io_gguf io, const char* key, const mlx_array arr);
+int mlx_io_gguf_set_metadata_array(
+    mlx_io_gguf io,
+    const char* key,
+    const mlx_array marr);
+int mlx_io_gguf_set_metadata_string(
+    mlx_io_gguf io,
+    const char* key,
+    const char* mstr);
+int mlx_io_gguf_set_metadata_vector_string(
+    mlx_io_gguf io,
+    const char* key,
+    const mlx_vector_string mvstr);
 
 /**@}*/
 
