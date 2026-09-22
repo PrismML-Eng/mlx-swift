@@ -111,4 +111,10 @@ final class SaveTests: XCTestCase {
         assertEqual(try XCTUnwrap(loaded["big"]), try XCTUnwrap(arrays["big"]))
     }
 
+    func testTruncatedDataThrows() throws {
+        let data = try saveToData(arrays: ["x": MLXArray([1, 2, 3])])
+        XCTAssertThrowsError(try loadArrays(data: Data(data.prefix(4))))
+        XCTAssertThrowsError(try loadArrays(data: Data()))
+    }
+
 }

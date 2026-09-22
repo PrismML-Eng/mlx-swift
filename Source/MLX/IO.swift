@@ -208,46 +208,51 @@ private func new_mlx_io_vtable_dataIO() -> mlx_io_vtable {
     } seek: { ptr, offset, whence in
         let state = Unmanaged<IOState>.fromOpaque(ptr!).takeUnretainedValue()
 
+        let base: Int
         switch whence {
         case SEEK_SET:
-            state.offset = Int(offset)
+            base = 0
         case SEEK_CUR:
-            state.offset += Int(offset)
+            base = state.offset
         case SEEK_END:
-            // offset is relative to the end of the data, not the current position.
-            // mlx's load_safetensors uses seek(0, end) + tell() to size the input.
-            state.offset = state.data.count + Int(offset)
+            base = state.data.count
         default:
-            break
+            return -1
         }
+        let (position, overflow) = base.addingReportingOverflow(Int(offset))
+        guard !overflow, position >= 0 else { return -1 }
+        state.offset = position
+        return 0
+
     } read: { ptr, data, n in
         let state = Unmanaged<IOState>.fromOpaque(ptr!).takeUnretainedValue()
-
-        if n + state.offset <= state.data.count {
-            guard let data = data else { return }
-            _ = state.data.withUnsafeBytes { buffer in
-                memcpy(data, buffer.baseAddress!.advanced(by: state.offset), n)
-            }
-            state.offset += n
+        guard n > 0, let data, state.offset <= state.data.count,
+            n <= state.data.count - state.offset
+        else { return 0 }
+        _ = state.data.withUnsafeBytes { buffer in
+            memcpy(data, buffer.baseAddress!.advanced(by: state.offset), n)
         }
+        state.offset += n
+        return n
 
     } read_at_offset: { ptr, data, n, offset in
         let state = Unmanaged<IOState>.fromOpaque(ptr!).takeUnretainedValue()
-
-        if n + offset <= state.data.count {
-            guard let data = data else { return }
-            _ = state.data.withUnsafeBytes { buffer in
-                memcpy(data, buffer.baseAddress!.advanced(by: offset), n)
-            }
-            state.offset = offset
+        guard n > 0, let data, offset >= 0, offset <= state.data.count,
+            n <= state.data.count - offset
+        else { return 0 }
+        _ = state.data.withUnsafeBytes { buffer in
+            memcpy(data, buffer.baseAddress!.advanced(by: offset), n)
         }
+        state.offset = offset
+        return n
 
     } write: { ptr, data, n in
         let state = Unmanaged<IOState>.fromOpaque(ptr!).takeUnretainedValue()
-
+        guard n > 0, let data else { return 0 }
         let buffer = UnsafeBufferPointer(start: data, count: n)
         state.data.append(buffer)
         state.offset += n
+        return n
 
     } label: { ptr in
         UnsafeRawPointer(label.utf8Start).assumingMemoryBound(to: Int8.self)
