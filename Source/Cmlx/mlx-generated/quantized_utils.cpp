@@ -202,7 +202,8 @@ METAL_FUNC void qmm_m16_block(
       mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
   mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
   auto ct_a = gemm_op.template get_left_input_cooperative_tensor<T, T, float>();
-  auto ct_b = gemm_op.template get_right_input_cooperative_tensor<T, T, float>();
+  auto ct_b =
+      gemm_op.template get_right_input_cooperative_tensor<T, T, float>();
   auto ct_c = gemm_op.template get_destination_cooperative_tensor<
       metal::remove_addrspace_t<decltype(ct_a)>,
       metal::remove_addrspace_t<decltype(ct_b)>,
@@ -226,7 +227,8 @@ METAL_FUNC void qmm_m16_block(
   ushort qlane[4];
 #pragma unroll
   for (int st = 0; st < 4; st++) {
-    qlane[st] = ushort((simd_lid & ~0x9u) | uint(st & 1) | (uint(st >> 1) << 3));
+    qlane[st] =
+        ushort((simd_lid & ~0x9u) | uint(st & 1) | (uint(st >> 1) << 3));
   }
   // Blocks are numbered per simdgroup: block i covers groups
   // g_begin + 2 * (ks + i * KS) and the one after it.

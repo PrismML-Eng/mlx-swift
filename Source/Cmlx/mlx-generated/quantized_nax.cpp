@@ -1105,8 +1105,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   // [0, 32) and (2, 3) columns [32, 64), each pair splitting K; partials
   // are summed through Ws, which this path does not otherwise use.
   if constexpr (
-      bits == 2 && group_size == 128 && BM == 32 && BN == 64 &&
-      WM * WN == 4) {
+      bits == 2 && group_size == 128 && BM == 32 && BN == 64 && WM * WN == 4) {
     if (M - y_row <= 16 && N < 65536) {
       const uint cb = simd_gid >> 1;
       const uint ks = simd_gid & 1;
@@ -1171,7 +1170,8 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   constexpr bool transpose_b = true;
 
   const short sgp_sm = min(int(SM), M - (y_row + tm));
-  // Rows of MMA work this simdgroup does per BK step: [kk_first, BK) by kk_step.
+  // Rows of MMA work this simdgroup does per BK step: [kk_first, BK) by
+  // kk_step.
   const bool mma_idle = kNaxRowFit == 1 && row_fit && sgp_sm <= 0;
   const short kk_first =
       mma_idle ? short(BK) : (k_half ? short(k_row * SK) : short(0));

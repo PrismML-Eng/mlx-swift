@@ -2383,8 +2383,8 @@ METAL_FUNC void qmm_t_splitk_nax_impl(
   if constexpr (kHalves == 1 && sizeof(T) == sizeof(float)) {
     constexpr int partial_size = 16 * SIMD_SIZE;
     if (simd_gid != 0) {
-      threadgroup float* dst = simd_gid == 3 ? red1 :
-          red0 + (simd_gid - 1) * partial_size;
+      threadgroup float* dst =
+          simd_gid == 3 ? red1 : red0 + (simd_gid - 1) * partial_size;
 #pragma unroll
       for (int h = 0; h < 2; h++) {
 #pragma unroll
@@ -2405,7 +2405,8 @@ METAL_FUNC void qmm_t_splitk_nax_impl(
           const U acc = left + right;
           const int v = fm + (i / 4) * 8;
           const int r = row0 + 16 * h + fn + (i % 4);
-          if (v < rows && r < N) y[v * N + r] = static_cast<T>(acc);
+          if (v < rows && r < N)
+            y[v * N + r] = static_cast<T>(acc);
         }
       }
     }
@@ -2507,8 +2508,8 @@ template <
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
 #ifdef MLX_QMM_SPLITK_NAX
-  // The tensor-unit body is only correct on generation-18+ GPUs (M5 class);
-  // the host selects `use_nax` from metal::is_nax_available().
+  // The host sets `use_nax` only when metal::is_nax_available() reports a
+  // tensor unit; every other GPU takes the SIMD body below.
   constexpr bool kSplitkNax = use_nax;
   if constexpr (
       kSplitkNax && metal::is_same_v<T, float> && bits == 2 &&
@@ -2521,14 +2522,36 @@ template <
     device T* yt = y + int(tid.y) * BM * static_cast<int64_t>(N);
     if (rows <= 16) {
       qmm_t_splitk_nax_impl<T, group_size, bits, 1>(
-          (const device uint32_t*)wl, scales, biases, xt, yt, K, N, rows,
-          k_partition_size, int(tid.x) * BN, simd_gid, simd_lid,
-          (threadgroup float*)Xs, (threadgroup float*)Ws);
+          (const device uint32_t*)wl,
+          scales,
+          biases,
+          xt,
+          yt,
+          K,
+          N,
+          rows,
+          k_partition_size,
+          int(tid.x) * BN,
+          simd_gid,
+          simd_lid,
+          (threadgroup float*)Xs,
+          (threadgroup float*)Ws);
     } else {
       qmm_t_splitk_nax_impl<T, group_size, bits, 2>(
-          (const device uint32_t*)wl, scales, biases, xt, yt, K, N, rows,
-          k_partition_size, int(tid.x) * BN, simd_gid, simd_lid,
-          (threadgroup float*)Xs, (threadgroup float*)Ws);
+          (const device uint32_t*)wl,
+          scales,
+          biases,
+          xt,
+          yt,
+          K,
+          N,
+          rows,
+          k_partition_size,
+          int(tid.x) * BN,
+          simd_gid,
+          simd_lid,
+          (threadgroup float*)Xs,
+          (threadgroup float*)Ws);
     }
     return;
   }
@@ -2548,9 +2571,20 @@ template <
       const device T* xt = x + int(tid.y) * BM * static_cast<int64_t>(K);
       device T* yt = y + int(tid.y) * BM * static_cast<int64_t>(N);
       qmm_t_splitk_nax_impl<T, group_size, bits, 1>(
-          (const device uint32_t*)wl, scales, biases, xt, yt, K, N, rows,
-          k_partition_size, int(tid.x) * BN, simd_gid, simd_lid,
-          (threadgroup float*)Xs, (threadgroup float*)Ws);
+          (const device uint32_t*)wl,
+          scales,
+          biases,
+          xt,
+          yt,
+          K,
+          N,
+          rows,
+          k_partition_size,
+          int(tid.x) * BN,
+          simd_gid,
+          simd_lid,
+          (threadgroup float*)Xs,
+          (threadgroup float*)Ws);
       return;
     }
   }
