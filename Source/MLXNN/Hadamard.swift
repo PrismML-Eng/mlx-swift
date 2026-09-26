@@ -867,12 +867,15 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
     public let scales: MLXArray
     public let biases: MLXArray?
     public let transform: SignedBlockHadamard
+    /// When set, dequantized rows are cast to this dtype before the inverse
+    /// transform (the published pack restores FP16 embedding activations).
+    public let outputDType: DType?
 
     public override var shape: (Int, Int) { (weight.dim(0), transform.width) }
 
     public init(
         weight: MLXArray, scales: MLXArray, biases: MLXArray?,
-        groupSize: Int, bits: Int, transform: SignedBlockHadamard
+        groupSize: Int, bits: Int, transform: SignedBlockHadamard, outputDType: DType? = nil
     ) throws {
         try validateHadamardWeights(
             weight, scales: scales, biases: biases,
@@ -882,6 +885,7 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
         self.scales = scales
         self.biases = biases
         self.transform = transform
+        self.outputDType = outputDType
         super.init(weight: weight)
         freeze()
     }
@@ -891,7 +895,8 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
         let rows = dequantized(
             weight[indices], scales: scales[indices],
             biases: biases.map { $0[indices] }, groupSize: groupSize, bits: bits)
-        return transform.inverse(rows).reshaped(x.shape + [transform.width])
+        return transform.inverse(rows.asType(outputDType ?? rows.dtype)).reshaped(
+            x.shape + [transform.width])
     }
 
     public override func asLinear(_ x: MLXArray) -> MLXArray {
