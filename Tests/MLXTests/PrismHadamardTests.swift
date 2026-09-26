@@ -1,6 +1,10 @@
 import Foundation
 import MLX
 import MLXNN
+// The tensor-unit path (M5 and later) forms FP32 products at the tensor
+// unit's reduced-precision class, about 8e-4 relative against an exact FP32
+// product, on the layer and on the reference GEMM alike; stock MLX behaves
+// the same on that hardware.
 import XCTest
 
 class PrismHadamardTests: XCTestCase {
@@ -61,7 +65,7 @@ class PrismHadamardTests: XCTestCase {
                         / (reference * reference).sum().sqrt()
                     XCTAssertTrue(actual.asArray(Float.self).allSatisfy { $0.isFinite })
                     XCTAssertLessThan(
-                        relative.item(Float.self), 1e-4,
+                        relative.item(Float.self), 2e-3,
                         "width=\(width) rows=\(rows) bits=\(bits)")
                 }
             }

@@ -1,6 +1,10 @@
 import Foundation
 import MLX
 import MLXNN
+// The tensor-unit path (M5 and later) forms FP32 products at the tensor
+// unit's reduced-precision class, about 8e-4 relative against an exact FP32
+// product, on the layer and on the reference GEMM alike; stock MLX behaves
+// the same on that hardware.
 import XCTest
 
 class HadamardLayerTests: XCTestCase {
@@ -32,7 +36,7 @@ class HadamardLayerTests: XCTestCase {
                 let relative =
                     (difference * difference).sum().sqrt()
                     / (reference * reference).sum().sqrt()
-                XCTAssertLessThan(relative.item(Float.self), dtype == .float32 ? 1e-4 : 0.02)
+                XCTAssertLessThan(relative.item(Float.self), dtype == .float32 ? 2e-3 : 0.02)
                 XCTAssertTrue(embedding.trainableParameters().flattened().isEmpty)
                 XCTAssertNil(quantizeSingle(layer: embedding))
             }
@@ -70,7 +74,8 @@ class HadamardLayerTests: XCTestCase {
                     packed, scales: scales, biases: biases, groupSize: 128, bits: 2
                 ).T)
             + MLXArray([Float(0.25), -0.25])
-        XCTAssertLessThan(abs(layer(input) - reference).max().item(Float.self), 1e-4)
+        XCTAssertLessThan(
+            (abs(layer(input) - reference).max() / abs(reference).max()).item(Float.self), 2e-3)
         XCTAssertThrowsError(try HadamardGDNLayout(width: 512, keyHeads: 3, valueHeads: 4))
     }
 
@@ -146,7 +151,7 @@ class HadamardLayerTests: XCTestCase {
             let difference = linear(input) - reference
             let relative =
                 (difference * difference).sum().sqrt() / (reference * reference).sum().sqrt()
-            XCTAssertLessThan(relative.item(Float.self), 1e-4, "bits \(bits)")
+            XCTAssertLessThan(relative.item(Float.self), 2e-3, "bits \(bits)")
         }
     }
 }
