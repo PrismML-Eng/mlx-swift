@@ -56,6 +56,113 @@ public struct SignedBlockHadamard {
     ) -> MLXArray?
     nonisolated(unsafe) public static var fusedTransform: FusedTransform?
 
+    /// A rotated activation quantized for the tensor route: `codes` holds
+    /// `round(x / scale) + 128` as UInt8 with one symmetric absmax `scale`
+    /// (FP32) per row and `groupSize` consecutive elements, and `scaledSums`
+    /// holds `scale * sum(round(x / scale))` per row and group (FP32), the
+    /// term a packed matmul over raw codes needs for the affine offsets.
+    public struct Int8Activation {
+        public let codes: MLXArray
+        public let scales: MLXArray
+        public let scaledSums: MLXArray
+        public init(codes: MLXArray, scales: MLXArray, scaledSums: MLXArray) {
+            self.codes = codes
+            self.scales = scales
+            self.scaledSums = scaledSums
+        }
+    }
+
+    /// The forward transform that quantizes its FP32 result per group into
+    /// an `Int8Activation` (`[..., width]` codes, `[..., width / groupSize]`
+    /// scales and scaled sums). Installed by the model file next to
+    /// `fusedTransform`; nil declines.
+    public typealias FusedTransformInt8 = (
+        _ x: MLXArray, _ signs: MLXArray, _ blockSize: Int, _ preSigned: Bool,
+        _ gdnLayout: HadamardGDNLayout?, _ groupSize: Int
+    ) -> Int8Activation?
+    nonisolated(unsafe) public static var fusedTransformInt8: FusedTransformInt8?
+
+    /// `forward` (or `applyPreSigned` when `preSigned`) quantized per group;
+    /// nil when no fused implementation provides it.
+    public func forwardInt8(
+        _ x: MLXArray, gdnLayout: HadamardGDNLayout?, preSigned: Bool, groupSize: Int
+    ) -> Int8Activation? {
+        validate(x)
+        guard let fused = Self.fusedTransformInt8 else { return nil }
+        if preSigned {
+            precondition(gdnLayout == nil, "pre-signed transform needs an ungrouped layout")
+        }
+        return fused(x, signs, blockSize, preSigned, gdnLayout, groupSize)
+    }
+
+    /// The forward transform stored in `outputDType` together with the FP32
+    /// sums of every `groupSize` consecutive rounded outputs (`[..., width /
+    /// groupSize]`), for the verify-width tensor route. Installed by the
+    /// model file; nil declines.
+    public typealias FusedTransformWithGroupSums = (
+        _ x: MLXArray, _ signs: MLXArray, _ blockSize: Int, _ preSigned: Bool,
+        _ gdnLayout: HadamardGDNLayout?, _ outputDType: DType, _ groupSize: Int
+    ) -> (MLXArray, MLXArray)?
+    nonisolated(unsafe) public static var fusedTransformWithGroupSums: FusedTransformWithGroupSums?
+
+    /// `forward` (or `applyPreSigned` when `preSigned`) with its per-group
+    /// sums; nil when no fused implementation provides them.
+    public func forwardWithGroupSums(
+        _ x: MLXArray, gdnLayout: HadamardGDNLayout?, preSigned: Bool, outputDType: DType,
+        groupSize: Int
+    ) -> (MLXArray, MLXArray)? {
+        validate(x)
+        guard let fused = Self.fusedTransformWithGroupSums else { return nil }
+        if preSigned {
+            precondition(gdnLayout == nil, "pre-signed transform needs an ungrouped layout")
+        }
+        return fused(x, signs, blockSize, preSigned, gdnLayout, outputDType, groupSize)
+    }
+
+    /// A packed projection's input producer that the quantizing rotation can
+    /// form in its read instead of reading a materialized FP32 array:
+    /// `silu(gate) * up`, `x * sigmoid(gate)`, or the GDN output's per-head
+    /// RMSNorm with its `silu(gate) * normed` tail (the same FP32 arithmetic
+    /// as the model's compiled chains, then the signs, the transform and the
+    /// quantization).
+    public enum Int8Producer {
+        case swiglu(gate: MLXArray, up: MLXArray)
+        case sigmoidGate(x: MLXArray, gate: MLXArray)
+        case gatedRMSNorm(x: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float)
+        /// `sigmoidGate` with `x` given as consecutive row blocks: block i is
+        /// a `[B, Lb, heads, headDim]` view of rows `i * Lb ..< (i + 1) * Lb`
+        /// of `gate`'s `[B, L, heads, headDim]` (the prompt attention's query
+        /// blocks), read where they are instead of concatenated first.
+        case sigmoidGateRowBlocks(blocks: [MLXArray], gate: MLXArray)
+
+        /// The array whose shape and dtype the product follows.
+        public var primary: MLXArray {
+            switch self {
+            case .swiglu(let gate, _): return gate
+            case .sigmoidGate(let x, _): return x
+            case .gatedRMSNorm(let x, _, _, _): return x
+            case .sigmoidGateRowBlocks(_, let gate): return gate
+            }
+        }
+    }
+
+    public typealias FusedTransformInt8Producer = (
+        _ producer: Int8Producer, _ signs: MLXArray, _ blockSize: Int,
+        _ gdnLayout: HadamardGDNLayout?, _ groupSize: Int
+    ) -> Int8Activation?
+    nonisolated(unsafe) public static var fusedTransformInt8Producer: FusedTransformInt8Producer?
+
+    /// `forwardInt8` of a producer's output formed inside the rotation; nil
+    /// when no fused implementation provides it.
+    public func forwardInt8(
+        producer: Int8Producer, gdnLayout: HadamardGDNLayout?, groupSize: Int
+    ) -> Int8Activation? {
+        let x = producer.primary
+        precondition(x.ndim > 0 && x.size % width == 0, "Hadamard input width mismatch")
+        guard let fused = Self.fusedTransformInt8Producer else { return nil }
+        return fused(producer, signs, blockSize, gdnLayout, groupSize)
+    }
+
     /// Transform activations before multiplication by folded weights.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         forward(x, gdnLayout: nil, outputDType: x.dtype)
@@ -103,12 +210,16 @@ public struct SignedBlockHadamard {
     }
 
     /// `self(x * sigmoid(gate))`, the attention output gate, fused the same way.
+    /// With strided inputs on, `[B, S, heads, headDim]` operands are read in
+    /// place (the result is `[B, S, width]`).
     public func rotatedSigmoidGate(
         _ x: MLXArray, gate: MLXArray, outputDType: DType = .float32
     ) -> MLXArray? {
         guard FusedInputHadamardKernel.gateEnabled, blockSize == 1024, width % 1024 == 0,
             x.dtype == .float32, gate.dtype == .float32, x.shape == gate.shape,
-            x.ndim > 0, x.dim(-1) == width
+            x.ndim > 0,
+            x.dim(-1) == width
+                || (HadamardStridedInputs.enabled && x.ndim == 4 && x.dim(2) * x.dim(3) == width)
         else { return nil }
         return FusedInputHadamardKernel.gated(
             x, gate, signs: signs, width: width, mode: 2, outputDType: outputDType)
@@ -135,7 +246,8 @@ public struct SignedBlockHadamard {
             headDim == 128, 1024 % headDim == 0,
             layout == nil || (layout!.width == width && layout!.valueHeads == valueHeads),
             repeats * keyHeads == valueHeads, x.shape == z.shape, x.dtype == .float32,
-            z.dtype == .float32, weight.dtype == .float32, weight.ndim == 1,
+            z.dtype == .float32 || z.dtype == .float16, weight.dtype == .float32,
+            weight.ndim == 1,
             weight.dim(0) == headDim
         else { return nil }
         return FusedInputHadamardKernel.gatedRMSNorm(
@@ -178,10 +290,21 @@ public struct SignedBlockHadamard {
     /// Recover the original basis after looking up folded embedding rows.
     public func inverse(_ x: MLXArray) -> MLXArray {
         validate(x)
+        if let fused = Self.fusedInverse, let y = fused(x, signs, blockSize) {
+            return y
+        }
         return
             (hadamardTransform(x.asType(.float32).reshaped([-1, blockSize])).reshaped(x.shape)
             * signs).asType(x.dtype)
     }
+
+    /// `inverse` as one kernel: the same values as
+    /// `(hadamardTransform(x.asType(.float32)) * signs).asType(x.dtype)`.
+    /// Installed by the model file; nil declines.
+    public typealias FusedInverse = (
+        _ x: MLXArray, _ signs: MLXArray, _ blockSize: Int
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var fusedInverse: FusedInverse?
 
     private func validate(_ x: MLXArray) {
         precondition(x.ndim > 0 && x.dim(-1) == width, "Hadamard input width mismatch")
@@ -308,14 +431,88 @@ public struct HadamardGDNLayout {
 /// MLXArray, so reflecting the owning layer cannot add any of these to the
 /// parameter tree. Nothing here depends on a request; it is keyed on the
 /// layer's own frozen constants.
+/// Constants derived from a packed projection's frozen scales and offsets
+/// for the tensor route (their FP16 values transposed to `[groups, rows]`,
+/// and the per-group code sums folded with the scales), built once per
+/// constant array and reused while that array object is unchanged. Like the
+/// cast cache, a plain class that is neither an MLXArray nor a Module.
+public final class HadamardConstantLayoutCache {
+    private struct Entry {
+        let source: MLXArray
+        let tag: Int
+        let derived: MLXArray
+    }
+    private let lock = NSLock()
+    private var entries: [Entry] = []
+    private var negativeBias: (scales: MLXArray, biases: MLXArray, matches: Bool)?
+
+    public init() {}
+
+    /// The array `build(source)` for this `source` object and `tag`, built on
+    /// first use.
+    public func derived(_ source: MLXArray, tag: Int, build: (MLXArray) -> MLXArray) -> MLXArray {
+        lock.withLock {
+            for entry in entries where entry.source === source && entry.tag == tag {
+                return entry.derived
+            }
+            let built = build(source)
+            if entries.count >= 6 {
+                entries.removeFirst()
+            }
+            entries.append(Entry(source: source, tag: tag, derived: built))
+            return built
+        }
+    }
+
+    /// The array `derived(source, tag:)` built earlier, or nil; never builds.
+    public func existing(_ source: MLXArray, tag: Int) -> MLXArray? {
+        lock.withLock {
+            entries.first { $0.source === source && $0.tag == tag }?.derived
+        }
+    }
+
+    /// Bits the model file's residency bookkeeping sets once per route that
+    /// reads this cache's constants (a plain flag, so the per-call check is a
+    /// load, not a lock). Nothing here reads it.
+    public var residencyMarks = 0
+
+    /// Check the frozen FP16 affine constants once, including signed zero.
+    /// This cache is cleared by the owning projection on parameter updates.
+    public func biasesAreNegativeScales(_ scales: MLXArray, _ biases: MLXArray) -> Bool {
+        lock.withLock {
+            if let negativeBias, negativeBias.scales === scales,
+                negativeBias.biases === biases
+            {
+                return negativeBias.matches
+            }
+            guard scales.dtype == .float16, biases.dtype == .float16,
+                scales.shape == biases.shape
+            else { return false }
+            let flipped = scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))
+            let matches = (flipped .== biases.view(dtype: .uint16)).all().item(Bool.self)
+            negativeBias = (scales, biases, matches)
+            return matches
+        }
+    }
+
+    public func clear() {
+        lock.withLock {
+            entries.removeAll()
+            negativeBias = nil
+        }
+    }
+}
+
 private final class HadamardMatrixRouteOperands {
     private let lock = NSLock()
     /// Sibling projections fused along their output axis; see
     /// `HadamardFusedSiblings`. Owned by the first sibling's operands.
     var fusedSiblings: HadamardFusedSiblings?
+    let layoutCache = HadamardConstantLayoutCache()
 
     func clear() {
         lock.withLock { fusedSiblings = nil }
+        layoutCache.clear()
     }
 
     /// The stacked operand for exactly these siblings, built on first use and
@@ -414,7 +611,14 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
-        applyRotated(rotate(x))
+        // The vocabulary head at verify width (16 rows) reaches the tensor
+        // route here; the tower projections reach it through the shared and
+        // pre-signed forwards below.
+        if let routed = tensorRouteForward(x, siblings: [self], preSigned: false, widenOutput: true)
+        {
+            return routed[0]
+        }
+        return applyRotated(rotate(x))
     }
 
     /// The input transform alone: GDN layout, signs, Hadamard, dtype restore.
@@ -484,7 +688,82 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// Off unless `MLX_HADAMARD_HEAD_F16=1`: a BF16 activation reading a
+    /// vocabulary head (a speculative drafter's shared-head read) takes the
+    /// FP16 read and, through `forwardUnwidened`, returns the FP16 logits as
+    /// they are. Opt-in because it also changes the logits a BF16 target model
+    /// would emit through the same head.
+    public static let drafterHeadFloat16: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLX_HADAMARD_HEAD_F16"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(value ?? "")
+    }()
+
+    /// On unless explicitly disabled: the zero rows that pad a verify-width
+    /// activation up to 16 are one resident buffer per shape, not a fresh
+    /// zeros kernel on every projection (ercumentyildirim `6e19fe1`).
+    /// `MLX_HADAMARD_NARROW_ZERO_PAD=0` allocates them again each call.
+    private static let narrowZeroPad: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLX_HADAMARD_NARROW_ZERO_PAD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    private struct NarrowPadKey: Hashable {
+        var rows: Int
+        var cols: Int
+        var dtype: DType
+    }
+    private static let narrowPadLock = NSLock()
+    nonisolated(unsafe) private static var narrowPads: [NarrowPadKey: MLXArray] = [:]
+
+    /// Zeros of `[rows, cols]` in `dtype`. The same buffer is reused across
+    /// projections; it is never written.
+    static func cachedNarrowZeros(rows: Int, cols: Int, dtype: DType) -> MLXArray {
+        guard narrowZeroPad, rows > 0, cols > 0 else {
+            return MLXArray.zeros([rows, cols], dtype: dtype)
+        }
+        let key = NarrowPadKey(rows: rows, cols: cols, dtype: dtype)
+        narrowPadLock.lock()
+        defer { narrowPadLock.unlock() }
+        if let hit = narrowPads[key] { return hit }
+        let made = MLXArray.zeros([rows, cols], dtype: dtype)
+        if narrowPads.count > 12 { narrowPads.removeAll(keepingCapacity: true) }
+        narrowPads[key] = made
+        return made
+    }
+
     private let matrixRoute = HadamardMatrixRouteOperands()
+
+    /// The leading-rows module of `leadingRows(_:)`, held off the module tree
+    /// (a plain class, as `matrixRoute` is), so it is never loaded, updated or
+    /// counted as a parameter of this module.
+    private final class LeadingRowsSlot {
+        var rows = 0
+        var module: HadamardQuantizedLinear?
+    }
+    private let leadingRowsSlot = LeadingRowsSlot()
+
+    /// The first `rows` output rows of this projection as a module of their
+    /// own: views of the same packed rows, scales and offsets under the same
+    /// transform, so every row it computes is this module's row, computed the
+    /// same way. Built once per row count and cached. Nil when it does not
+    /// apply (a GDN layout, a bias, or `rows` not inside the output width).
+    ///
+    /// A block drafter that reads the target's vocabulary head uses it to
+    /// score a frequency-ranked prefix of the vocabulary. This module itself,
+    /// and every target read through it, is unchanged.
+    public func leadingRows(_ rows: Int) -> HadamardQuantizedLinear? {
+        guard rows > 0, rows < weight.dim(0), gdnLayout == nil, bias == nil else { return nil }
+        if leadingRowsSlot.rows == rows, let module = leadingRowsSlot.module { return module }
+        guard
+            let module = try? HadamardQuantizedLinear(
+                weight: weight[0 ..< rows], scales: scales[0 ..< rows], biases: biases?[0 ..< rows],
+                groupSize: groupSize, bits: bits, transform: transform)
+        else { return nil }
+        leadingRowsSlot.rows = rows
+        leadingRowsSlot.module = module
+        return module
+    }
 
     @discardableResult
     public override func update(
@@ -534,12 +813,507 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             widenOutput: widenOutput)
     }
 
+    // MARK: - Tensor route (raw codes on the tensor unit)
+
+    /// A packed matmul that multiplies a quantized rotated activation by the
+    /// raw 2-bit codes on the tensor unit and applies the FP16 scale and
+    /// offset of every 128-group in FP32. Weights are read as stored; the
+    /// constants are read through a `HadamardConstantLayoutCache`. Installed
+    /// by the model file; nil declines. Arguments: the activation (`[rows,
+    /// k]` codes), packed weight `[n, k / 16]`, scales and offsets `[n, k /
+    /// groupSize]` FP16, the group size, the output dtype, the layout cache.
+    public typealias TensorPackedMatmul = (
+        _ activation: SignedBlockHadamard.Int8Activation, _ weight: MLXArray,
+        _ scales: MLXArray, _ biases: MLXArray, _ groupSize: Int, _ outputDType: DType,
+        _ layoutCache: HadamardConstantLayoutCache
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var tensorPackedMatmul: TensorPackedMatmul?
+    /// Whether the installed matmul takes a product of this shape.
+    nonisolated(unsafe) public static var tensorPackedMatmulApplies:
+        ((_ rows: Int, _ n: Int, _ k: Int) -> Bool)?
+
+    /// The verify-width form of the tensor route: the FP16 rotated activation
+    /// (`[16, k]`, rows beyond the real ones zero) with its FP32 group sums
+    /// (`[16, k / groupSize]`); returns `[16, n]`. Installed by the model file.
+    public typealias TensorPackedMatmulNarrow = (
+        _ rotated: MLXArray, _ groupSums: MLXArray, _ weight: MLXArray, _ scales: MLXArray,
+        _ biases: MLXArray, _ groupSize: Int, _ outputDType: DType,
+        _ layoutCache: HadamardConstantLayoutCache
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var tensorPackedMatmulNarrow: TensorPackedMatmulNarrow?
+    nonisolated(unsafe) public static var tensorPackedMatmulNarrowApplies:
+        ((_ rows: Int, _ n: Int, _ k: Int) -> Bool)?
+    /// The verify-width form over the quantized rotation (`forwardInt8` of
+    /// the activation padded to 16 rows, as the prompt route quantizes it):
+    /// codes `[16, k]`, scales and scaled sums `[16, k / groupSize]`; returns
+    /// `[16, n]`. Installed by the model file; preferred over
+    /// `tensorPackedMatmulNarrow` when both are installed.
+    public typealias TensorPackedMatmulNarrowInt8 = (
+        _ activation: SignedBlockHadamard.Int8Activation, _ weight: MLXArray, _ scales: MLXArray,
+        _ biases: MLXArray, _ groupSize: Int, _ outputDType: DType,
+        _ layoutCache: HadamardConstantLayoutCache
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var tensorPackedMatmulNarrowInt8:
+        TensorPackedMatmulNarrowInt8?
+    static var narrowRouteInstalled: Bool {
+        (tensorPackedMatmulNarrow != nil || tensorPackedMatmulNarrowInt8 != nil)
+            && tensorPackedMatmulNarrowApplies != nil
+    }
+
+    /// The vocabulary head at verify width, on the matrix route: the FP16
+    /// rotated activation (`[16, k]`, rows beyond the real ones zero) against
+    /// a head-sized packed weight, returning `[16, n]` in `outputDType`
+    /// (FP32 logits for the target's read, FP16 for the drafter's unwidened
+    /// read). Installed by the model file; nil declines.
+    public typealias TensorPackedMatmulHead = (
+        _ rotated: MLXArray, _ weight: MLXArray, _ scales: MLXArray, _ biases: MLXArray,
+        _ groupSize: Int, _ outputDType: DType
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var tensorPackedMatmulHead: TensorPackedMatmulHead?
+    /// A verify window: at most this many rows take the narrow form.
+    static let tensorRouteMaximumNarrowRows = 16
+
+    /// On unless explicitly disabled: `MLX_HADAMARD_TENSOR_ROUTE=0` keeps
+    /// the dequantizing matrix route for every width.
+    private static let tensorRouteEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLX_HADAMARD_TENSOR_ROUTE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Prompt widths only: a verify window (<= 17 rows) keeps the matrix route.
+    private static let tensorRouteMinimumRows = 128
+
+    private func tensorRouteTakes(_ layer: HadamardQuantizedLinear) -> Bool {
+        layer.mode == .affine && layer.bits == 2 && layer.groupSize == 128 && layer.bias == nil
+            && layer.scales.dtype == .float16 && layer.biases != nil
+            && layer.biases!.dtype == .float16 && layer.weight.dim(0) % 64 == 0
+            && layer.weight.dim(1) == weight.dim(1) && layer.transform.blockSize == 1024
+    }
+
+    /// The tensor route for `siblings` (self first) over one FP32 activation:
+    /// one fused rotation with group sums, one packed matmul over the stacked
+    /// codes, split per sibling. Nil when the route does not apply.
+    fileprivate func tensorRouteForward(
+        _ x: MLXArray, siblings: [HadamardQuantizedLinear], preSigned: Bool, widenOutput: Bool
+    ) -> [MLXArray]? {
+        guard Self.tensorRouteEnabled, x.dtype == .float32, x.ndim >= 2,
+            !siblings.isEmpty, siblings[0] === self
+        else { return nil }
+        let k = x.dim(-1)
+        let rows = x.size / k
+        let promptWidth = rows >= Self.tensorRouteMinimumRows && rows % 64 == 0
+        let verifyWidth = rows <= Self.tensorRouteMaximumNarrowRows
+        guard k % 128 == 0,
+            (promptWidth && Self.tensorPackedMatmul != nil && Self.tensorPackedMatmulApplies != nil)
+                || (verifyWidth && Self.narrowRouteInstalled)
+        else { return nil }
+        var n = 0
+        for sibling in siblings {
+            guard tensorRouteTakes(sibling) else { return nil }
+            if sibling !== self {
+                guard gdnLayout == nil, sibling.sharesInputTransform(with: self) else { return nil }
+            }
+            n += sibling.weight.dim(0)
+        }
+        let outputDType: DType = widenOutput ? .float32 : .float16
+        let leading = Array(x.shape.dropLast())
+        if !promptWidth {
+            return tensorRouteForwardNarrow(
+                x.reshaped(rows, k), rows: rows, k: k, n: n, siblings: siblings,
+                preSigned: preSigned, outputDType: outputDType, leading: leading)
+        }
+        guard let applies = Self.tensorPackedMatmulApplies,
+            applies(rows, n, k),
+            let activation = transform.forwardInt8(
+                x.reshaped(rows, k), gdnLayout: gdnLayout, preSigned: preSigned, groupSize: 128)
+        else { return nil }
+        return tensorRoutePromptMatmul(
+            activation, siblings: siblings, n: n, outputDType: outputDType, leading: leading)
+    }
+
+    /// Whether `tensorRouteForward` may take an FP32 activation of `rows` rows
+    /// for `siblings` (self first); false means the matrix route serves it.
+    /// At verify width either narrow form counts (`narrowRouteInstalled`: the
+    /// FP16-activation form or the int8-activation form), exactly as
+    /// `tensorRouteForward` itself admits them.
+    fileprivate func tensorRouteMayTake(rows: Int, siblings: [HadamardQuantizedLinear]) -> Bool {
+        guard Self.tensorRouteEnabled, !siblings.isEmpty, siblings[0] === self else { return false }
+        let promptWidth = rows >= Self.tensorRouteMinimumRows && rows % 64 == 0
+        let verifyWidth = rows <= Self.tensorRouteMaximumNarrowRows
+        guard transform.width % 128 == 0,
+            (promptWidth && Self.tensorPackedMatmul != nil && Self.tensorPackedMatmulApplies != nil)
+                || (verifyWidth && Self.narrowRouteInstalled)
+        else { return false }
+        return siblings.allSatisfy { tensorRouteTakes($0) }
+    }
+
+    /// True when the verify-width tensor route (either narrow form) is
+    /// installed and on and `rows` is a verify width: the tower's packed
+    /// projections at that width may then take the tensor route rather than
+    /// the matrix route (the per-projection guards still apply).
+    public static func tensorRouteTakesNarrowRows(_ rows: Int) -> Bool {
+        tensorRouteEnabled && narrowRouteInstalled && rows >= 1
+            && rows <= tensorRouteMaximumNarrowRows
+    }
+
+    /// The prompt-width packed matmul of `tensorRouteForward` over an
+    /// activation already quantized for the route: one matmul for one
+    /// projection, or one over the stacked siblings split back per sibling.
+    private func tensorRoutePromptMatmul(
+        _ activation: SignedBlockHadamard.Int8Activation, siblings: [HadamardQuantizedLinear],
+        n: Int, outputDType: DType, leading: [Int]
+    ) -> [MLXArray]? {
+        guard let matmul = Self.tensorPackedMatmul else { return nil }
+        if siblings.count == 1 {
+            guard
+                let y = matmul(
+                    activation, weight, scales, biases!, groupSize, outputDType,
+                    matrixRoute.layoutCache)
+            else { return nil }
+            return [y.reshaped(leading + [n])]
+        }
+        let fused = matrixRoute.fusedSiblings(for: siblings)
+        guard let fusedBiases = fused.biases,
+            let wide = matmul(
+                activation, fused.weight, fused.scales, fusedBiases, groupSize, outputDType,
+                fused.operands.layoutCache)
+        else { return nil }
+        return MLX.split(
+            wide.reshaped(leading + [n]), indices: Array(fused.boundaries.dropLast()), axis: -1)
+    }
+
+    /// True when the prompt-width tensor route is installed and on and `rows`
+    /// is a width its prompt branch takes (the per-projection guards of
+    /// `sharedHadamardTensorRouteTakesPrompt` still apply).
+    public static func tensorRouteTakesPromptRows(_ rows: Int) -> Bool {
+        tensorRouteEnabled && tensorPackedMatmul != nil && tensorPackedMatmulApplies != nil
+            && SignedBlockHadamard.fusedTransformInt8 != nil
+            && rows >= tensorRouteMinimumRows && rows % 64 == 0
+    }
+
+    /// True when the int8-activation verify-width route is installed and on
+    /// and `rows` is a full verify window (16 rows: the narrow route pads
+    /// nothing, so a quantized rotation formed elsewhere for these rows is
+    /// exactly the one `tensorRouteForwardNarrowInt8` would form). The
+    /// per-projection guards of `sharedHadamardTensorRouteTakesNarrowInt8`
+    /// still apply.
+    public static func tensorRouteTakesNarrowInt8Rows(_ rows: Int) -> Bool {
+        tensorRouteEnabled && tensorPackedMatmulNarrowInt8 != nil
+            && tensorPackedMatmulNarrowApplies != nil
+            && SignedBlockHadamard.fusedTransformInt8 != nil
+            && rows == tensorRouteMaximumNarrowRows
+    }
+
+    /// True when `tensorRouteForward` takes `siblings` (self first) at prompt
+    /// width for an FP32 `[rows, transform.width]` activation: every guard of
+    /// its prompt branch, including the installed quantizing rotation that
+    /// `forwardInt8` needs. A caller that forms the quantized activation some
+    /// other way asks this before it launches anything.
+    fileprivate func tensorRouteTakesPrompt(
+        rows: Int, siblings: [HadamardQuantizedLinear]
+    ) -> Bool {
+        guard Self.tensorRouteEnabled, !siblings.isEmpty, siblings[0] === self,
+            Self.tensorPackedMatmul != nil, let applies = Self.tensorPackedMatmulApplies,
+            SignedBlockHadamard.fusedTransformInt8 != nil
+        else { return false }
+        let k = transform.width
+        guard rows >= Self.tensorRouteMinimumRows, rows % 64 == 0, k % 128 == 0 else {
+            return false
+        }
+        var n = 0
+        for sibling in siblings {
+            guard tensorRouteTakes(sibling) else { return false }
+            if sibling !== self {
+                guard gdnLayout == nil, sibling.sharesInputTransform(with: self) else {
+                    return false
+                }
+            }
+            n += sibling.weight.dim(0)
+        }
+        return applies(rows, n, k)
+    }
+
+    /// True when `tensorRouteForward` takes `siblings` (self first) through its
+    /// int8-activation narrow branch for an FP32 `[rows, transform.width]`
+    /// activation of a full verify window (no padding rows): every guard of
+    /// that branch (`tensorRouteForwardNarrowInt8`), with self's input read
+    /// in the plain layout (no GDN layout), so the branch's `forwardInt8`
+    /// is the plain quantizing rotation of the activation.
+    fileprivate func tensorRouteTakesNarrowInt8(
+        rows: Int, siblings: [HadamardQuantizedLinear]
+    ) -> Bool {
+        guard Self.tensorRouteTakesNarrowInt8Rows(rows), !siblings.isEmpty,
+            siblings[0] === self, gdnLayout == nil,
+            let applies = Self.tensorPackedMatmulNarrowApplies
+        else { return false }
+        let k = transform.width
+        guard k % 128 == 0 else { return false }
+        var n = 0
+        for sibling in siblings {
+            guard tensorRouteTakes(sibling) else { return false }
+            if sibling !== self {
+                guard sibling.sharesInputTransform(with: self) else { return false }
+            }
+            n += sibling.weight.dim(0)
+        }
+        return applies(rows, n, k)
+    }
+
+    /// `tensorRouteForwardNarrowInt8`'s matmul on an activation that is
+    /// exactly what its `forwardInt8` would have returned for the unpadded
+    /// `[rows, k]` input (rows == 16): the same matmul, the result shaped
+    /// `leading + [n]` and split per sibling.
+    private func tensorRouteNarrowInt8Matmul(
+        _ activation: SignedBlockHadamard.Int8Activation, n: Int,
+        siblings: [HadamardQuantizedLinear], outputDType: DType, leading: [Int]
+    ) -> [MLXArray]? {
+        guard let matmul = Self.tensorPackedMatmulNarrowInt8 else { return nil }
+        if siblings.count == 1 {
+            guard
+                let y = matmul(
+                    activation, weight, scales, biases!, groupSize, outputDType,
+                    matrixRoute.layoutCache)
+            else { return nil }
+            return [y.reshaped(leading + [n])]
+        }
+        let fused = matrixRoute.fusedSiblings(for: siblings)
+        guard let fusedBiases = fused.biases,
+            let wide = matmul(
+                activation, fused.weight, fused.scales, fusedBiases, groupSize, outputDType,
+                fused.operands.layoutCache)
+        else { return nil }
+        return MLX.split(
+            wide.reshaped(leading + [n]), indices: Array(fused.boundaries.dropLast()), axis: -1)
+    }
+
+    /// `tensorRouteForward`'s prompt branch on an activation that is exactly
+    /// what `forwardInt8` would have returned for the `[rows, k]` input: the
+    /// same guards, the same matmul, the result shaped `leading + [n]` and
+    /// split per sibling. Nil when the route does not take it.
+    fileprivate func tensorRouteForwardQuantized(
+        _ activation: SignedBlockHadamard.Int8Activation, rows: Int, leading: [Int],
+        siblings: [HadamardQuantizedLinear], widenOutput: Bool
+    ) -> [MLXArray]? {
+        let k = transform.width
+        // A full verify window on the int8-activation narrow route reads the
+        // activation through that route's matmul instead.
+        let narrow = tensorRouteTakesNarrowInt8(rows: rows, siblings: siblings)
+        guard narrow || tensorRouteTakesPrompt(rows: rows, siblings: siblings),
+            leading.reduce(1, *) == rows,
+            activation.codes.dtype == .uint8 || activation.codes.dtype == .int8,
+            activation.codes.shape == [rows, k],
+            activation.scales.dtype == .float32, activation.scales.shape == [rows, k / 128],
+            activation.scaledSums.dtype == .float32,
+            activation.scaledSums.shape == [rows, k / 128]
+        else { return nil }
+        let n = siblings.reduce(0) { $0 + $1.weight.dim(0) }
+        if narrow {
+            return tensorRouteNarrowInt8Matmul(
+                activation, n: n, siblings: siblings,
+                outputDType: widenOutput ? .float32 : .float16, leading: leading)
+        }
+        return tensorRoutePromptMatmul(
+            activation, siblings: siblings, n: n,
+            outputDType: widenOutput ? .float32 : .float16, leading: leading)
+    }
+
+    /// On unless explicitly disabled: `MLX_HADAMARD_TENSOR_ROUTE_PRODUCER=0`
+    /// keeps the materialized producer (the compiled elementwise chain) in
+    /// front of the quantizing rotation at prompt width.
+    private static let producerRouteEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLX_HADAMARD_TENSOR_ROUTE_PRODUCER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The prompt-width tensor route with this projection's input producer
+    /// folded into the quantizing rotation. Nil when it does not apply.
+    fileprivate func tensorRouteForwardProducer(
+        _ producer: SignedBlockHadamard.Int8Producer, widenOutput: Bool
+    ) -> MLXArray? {
+        guard Self.tensorRouteEnabled, Self.producerRouteEnabled,
+            let matmul = Self.tensorPackedMatmul, let applies = Self.tensorPackedMatmulApplies
+        else { return nil }
+        let x = producer.primary
+        let k = transform.width
+        guard x.ndim >= 2, x.size % k == 0 else { return nil }
+        let rows = x.size / k
+        let n = weight.dim(0)
+        guard rows >= Self.tensorRouteMinimumRows, rows % 64 == 0, k % 128 == 0,
+            tensorRouteTakes(self), applies(rows, n, k),
+            let activation = transform.forwardInt8(
+                producer: producer, gdnLayout: gdnLayout, groupSize: 128)
+        else { return nil }
+        let flat = SignedBlockHadamard.Int8Activation(
+            codes: activation.codes.reshaped(rows, k),
+            scales: activation.scales.reshaped(rows, k / 128),
+            scaledSums: activation.scaledSums.reshaped(rows, k / 128))
+        let outputDType: DType = widenOutput ? .float32 : .float16
+        guard
+            let y = matmul(
+                flat, weight, scales, biases!, groupSize, outputDType, matrixRoute.layoutCache)
+        else { return nil }
+        let leading = x.ndim == 4 ? [x.dim(0), x.dim(1)] : Array(x.shape.dropLast())
+        return y.reshaped(leading + [n])
+    }
+
+    /// Whether a full verify window's output projections (SwiGLU -> down,
+    /// the attention gate -> o_proj, the GDN gated norm -> out_proj) take
+    /// `tensorRouteNarrowForwardProducer`: the quantizing rotation forms the
+    /// producer in its read instead of a separate elementwise launch storing
+    /// the signed product first. Off unless `MLX_HADAMARD_NARROW_PRODUCER=1`; the
+    /// model's load-time round trial may switch it (and only adopts it when
+    /// its rounds are faster).
+    nonisolated(unsafe) public static var narrowProducerActive: Bool = narrowProducerForced ?? false
+
+    /// `MLX_HADAMARD_NARROW_PRODUCER` when set explicitly (on or off); nil lets the
+    /// model decide (its load-time trial, else off).
+    public static let narrowProducerForced: Bool? = {
+        guard
+            let value = ProcessInfo.processInfo.environment["MLX_HADAMARD_NARROW_PRODUCER"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !value.isEmpty
+        else { return nil }
+        if ["1", "true", "yes", "on"].contains(value) { return true }
+        if ["0", "false", "no", "off"].contains(value) { return false }
+        return nil
+    }()
+
+    /// The int8-activation verify-width route of a producer's output, formed
+    /// inside the quantizing rotation (`forwardInt8(producer:)`): the same
+    /// activation `tensorRouteForwardNarrowInt8` quantizes from the stored
+    /// signed product (the producer's FP32 expressions are the elementwise
+    /// launches'), against the same packed matmul. A full window only (16
+    /// rows: the narrow route pads nothing). Nil when it does not apply or the
+    /// fused implementation declines.
+    fileprivate func tensorRouteNarrowForwardProducer(
+        _ producer: SignedBlockHadamard.Int8Producer, widenOutput: Bool
+    ) -> MLXArray? {
+        guard Self.narrowProducerActive, Self.tensorRouteEnabled,
+            let matmul = Self.tensorPackedMatmulNarrowInt8,
+            let applies = Self.tensorPackedMatmulNarrowApplies
+        else { return nil }
+        let x = producer.primary
+        let k = transform.width
+        guard x.ndim >= 2, x.size % k == 0 else { return nil }
+        let rows = x.size / k
+        let n = weight.dim(0)
+        guard rows == Self.tensorRouteMaximumNarrowRows, k % 128 == 0, tensorRouteTakes(self),
+            applies(rows, n, k),
+            let activation = transform.forwardInt8(
+                producer: producer, gdnLayout: gdnLayout, groupSize: 128)
+        else { return nil }
+        let flat = SignedBlockHadamard.Int8Activation(
+            codes: activation.codes.reshaped(rows, k),
+            scales: activation.scales.reshaped(rows, k / 128),
+            scaledSums: activation.scaledSums.reshaped(rows, k / 128))
+        let outputDType: DType = widenOutput ? .float32 : .float16
+        guard
+            let y = matmul(
+                flat, weight, scales, biases!, groupSize, outputDType, matrixRoute.layoutCache)
+        else { return nil }
+        let leading = x.ndim == 4 ? [x.dim(0), x.dim(1)] : Array(x.shape.dropLast())
+        return y.reshaped(leading + [n])
+    }
+
+    /// The verify-width tensor route: one FP16 rotation with group sums, rows
+    /// padded to 16, one packed matmul over the (stacked) codes.
+    private func tensorRouteForwardNarrow(
+        _ x: MLXArray, rows: Int, k: Int, n: Int, siblings: [HadamardQuantizedLinear],
+        preSigned: Bool, outputDType: DType, leading: [Int]
+    ) -> [MLXArray]? {
+        if let matmul = Self.tensorPackedMatmulNarrowInt8 {
+            return tensorRouteForwardNarrowInt8(
+                x, rows: rows, k: k, n: n, siblings: siblings, preSigned: preSigned,
+                outputDType: outputDType, leading: leading, matmul: matmul)
+        }
+        guard let matmul = Self.tensorPackedMatmulNarrow,
+            let applies = Self.tensorPackedMatmulNarrowApplies, applies(rows, n, k),
+            let (rotated, sums) = transform.forwardWithGroupSums(
+                x, gdnLayout: gdnLayout, preSigned: preSigned, outputDType: .float16,
+                groupSize: 128)
+        else { return nil }
+        var a = rotated
+        var g = sums
+        let padded = Self.tensorRouteMaximumNarrowRows
+        if rows < padded {
+            a = concatenated(
+                [a, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: .float16)], axis: 0)
+            g = concatenated(
+                [g, Self.cachedNarrowZeros(rows: padded - rows, cols: k / 128, dtype: .float32)],
+                axis: 0)
+        }
+        if siblings.count == 1 {
+            guard
+                let y = matmul(
+                    a, g, weight, scales, biases!, groupSize, outputDType, matrixRoute.layoutCache)
+            else { return nil }
+            let rowsOut = rows < padded ? y[0 ..< rows] : y
+            return [rowsOut.reshaped(leading + [n])]
+        }
+        let fused = matrixRoute.fusedSiblings(for: siblings)
+        guard let fusedBiases = fused.biases,
+            let wide = matmul(
+                a, g, fused.weight, fused.scales, fusedBiases, groupSize, outputDType,
+                fused.operands.layoutCache)
+        else { return nil }
+        let rowsOut = rows < padded ? wide[0 ..< rows] : wide
+        return MLX.split(
+            rowsOut.reshaped(leading + [n]), indices: Array(fused.boundaries.dropLast()), axis: -1)
+    }
+
+    /// The verify-width tensor route over the quantized rotation: the FP32
+    /// activation padded to 16 rows, one quantizing rotation (8-bit codes per
+    /// 128-group, as the prompt route), one packed matmul over the (stacked)
+    /// codes, the real rows sliced back.
+    private func tensorRouteForwardNarrowInt8(
+        _ x: MLXArray, rows: Int, k: Int, n: Int, siblings: [HadamardQuantizedLinear],
+        preSigned: Bool, outputDType: DType, leading: [Int],
+        matmul: TensorPackedMatmulNarrowInt8
+    ) -> [MLXArray]? {
+        guard let applies = Self.tensorPackedMatmulNarrowApplies, applies(rows, n, k)
+        else { return nil }
+        let padded = Self.tensorRouteMaximumNarrowRows
+        let input =
+            rows < padded
+            ? concatenated(
+                [x, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: x.dtype)], axis: 0)
+            : x
+        guard
+            let activation = transform.forwardInt8(
+                input, gdnLayout: gdnLayout, preSigned: preSigned, groupSize: 128)
+        else { return nil }
+        if siblings.count == 1 {
+            guard
+                let y = matmul(
+                    activation, weight, scales, biases!, groupSize, outputDType,
+                    matrixRoute.layoutCache)
+            else { return nil }
+            let rowsOut = rows < padded ? y[0 ..< rows] : y
+            return [rowsOut.reshaped(leading + [n])]
+        }
+        let fused = matrixRoute.fusedSiblings(for: siblings)
+        guard let fusedBiases = fused.biases,
+            let wide = matmul(
+                activation, fused.weight, fused.scales, fusedBiases, groupSize, outputDType,
+                fused.operands.layoutCache)
+        else { return nil }
+        let rowsOut = rows < padded ? wide[0 ..< rows] : wide
+        return MLX.split(
+            rowsOut.reshaped(leading + [n]), indices: Array(fused.boundaries.dropLast()), axis: -1)
+    }
+
     /// `callAsFunction` for a consumer that promotes dtypes itself, such as
     /// the residual add: when the route applies, the FP16 product is returned
     /// as is instead of being widened first. The consumer's promotion widens
     /// the same values exactly, so the arithmetic is unchanged and one cast
     /// dispatch per call is saved.
     public func forwardUnwidened(_ x: MLXArray) -> MLXArray {
+        if let routed = tensorRouteForward(
+            x, siblings: [self], preSigned: false, widenOutput: false)
+        {
+            return routed[0]
+        }
         let rotated = rotate(x)
         return matrixRegimeForward(rotated, widenOutput: false) ?? applyRotated(rotated)
     }
@@ -549,6 +1323,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// FP16 product unwidened. Not for a layer with a GDN layout.
     public func forwardPreSigned(_ signed: MLXArray, widenOutput: Bool = true) -> MLXArray {
         precondition(gdnLayout == nil, "pre-signed forward needs an ungrouped layout")
+        if let routed = tensorRouteForward(
+            signed, siblings: [self], preSigned: true, widenOutput: widenOutput)
+        {
+            return routed[0]
+        }
         let rotated = transform.applyPreSigned(signed)
         if !widenOutput, let routed = matrixRegimeForward(rotated, widenOutput: false) {
             return routed
@@ -563,6 +1342,19 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         let k = transform.width
         guard Self.routeApplies(to: self), rows >= 2, k % 64 == 0, k % groupSize == 0
         else { return nil }
+        // At prompt width the tensor route (raw codes on the tensor unit, an
+        // 8-bit activation) takes the projection instead; its callers fall
+        // back to the pre-signed / gated paths that reach `tensorRouteForward`.
+        if Self.tensorRouteEnabled, Self.tensorPackedMatmul != nil,
+            rows >= Self.tensorRouteMinimumRows, rows % 64 == 0
+        {
+            return nil
+        }
+        if Self.tensorRouteEnabled, Self.narrowRouteInstalled,
+            rows <= Self.tensorRouteMaximumNarrowRows
+        {
+            return nil
+        }
         return Self.routeInputDType(rows: rows, n: weight.dim(0), sourceDType: .float32)
     }
 
@@ -582,6 +1374,14 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public func applyAfterSwiGLU(gate: MLXArray, up: MLXArray, widenOutput: Bool = true)
         -> MLXArray?
     {
+        if gdnLayout == nil,
+            let y = tensorRouteForwardProducer(
+                .swiglu(gate: gate, up: up), widenOutput: widenOutput)
+                ?? tensorRouteNarrowForwardProducer(
+                    .swiglu(gate: gate, up: up), widenOutput: widenOutput)
+        {
+            return y
+        }
         guard gdnLayout == nil,
             let store = fusedInputStoreDType(rows: gate.size / max(transform.width, 1)),
             let rotated = transform.rotatedSwiGLU(gate: gate, up: up, outputDType: store)
@@ -593,8 +1393,65 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public func applyAfterSigmoidGate(_ x: MLXArray, gate: MLXArray, widenOutput: Bool = true)
         -> MLXArray?
     {
+        if gdnLayout == nil,
+            let y = tensorRouteForwardProducer(
+                .sigmoidGate(x: x, gate: gate), widenOutput: widenOutput)
+        {
+            return y
+        }
         guard gdnLayout == nil,
             let store = fusedInputStoreDType(rows: x.size / max(transform.width, 1)),
+            let rotated = transform.rotatedSigmoidGate(x, gate: gate, outputDType: store)
+        else { return nil }
+        return fusedInputForward(rotated, widenOutput: widenOutput)
+    }
+
+    /// `applyAfterSigmoidGate` for `[B, S, heads, headDim]` operands read
+    /// through their strides, on the prompt-width tensor route only: its
+    /// producer reads the head-transposed attention output and the gate half
+    /// of each q|gate head in place (newjordan's `9024f66b`), so neither is
+    /// reshaped into a copy first. Nil when the route does not take them (the
+    /// caller then reshapes and calls `applyAfterSigmoidGate`).
+    public func applyAfterSigmoidGateHeadsOnRoute(
+        _ x: MLXArray, gate: MLXArray, widenOutput: Bool = true
+    ) -> MLXArray? {
+        guard gdnLayout == nil, x.ndim == 4, x.shape == gate.shape else { return nil }
+        return tensorRouteForwardProducer(
+            .sigmoidGate(x: x, gate: gate), widenOutput: widenOutput)
+    }
+
+    /// `applyAfterSigmoidGateHeadsOnRoute` with the attention output given as
+    /// its query blocks (`[B, Lb, heads, headDim]` views, in row order) rather
+    /// than their concatenation; the producer reads each block where it is.
+    /// Same elements, same arithmetic. Nil when the route or the fused
+    /// implementation does not take them (the caller then concatenates).
+    public func applyAfterSigmoidGateRowBlocksOnRoute(
+        _ blocks: [MLXArray], gate: MLXArray, widenOutput: Bool = true
+    ) -> MLXArray? {
+        guard gdnLayout == nil, !blocks.isEmpty, gate.ndim == 4 else { return nil }
+        return tensorRouteForwardProducer(
+            .sigmoidGateRowBlocks(blocks: blocks, gate: gate), widenOutput: widenOutput)
+    }
+
+    /// `applyAfterSigmoidGate` for `[B, S, heads, headDim]` operands read
+    /// through their strides by the fused-input rotation (the verify width's
+    /// matrix route): the head-transposed attention output and the gate half
+    /// of each q|gate head are not reshaped into copies first. Same elements,
+    /// same arithmetic. Nil when it does not apply (the caller then reshapes).
+    public func applyAfterSigmoidGateHeads(
+        _ x: MLXArray, gate: MLXArray, widenOutput: Bool = true
+    ) -> MLXArray? {
+        // A full verify window on the int8 route: the gate formed in the
+        // quantizing rotation's read (`tensorRouteNarrowForwardProducer`).
+        if gdnLayout == nil, x.ndim == 4, x.shape == gate.shape,
+            let y = tensorRouteNarrowForwardProducer(
+                .sigmoidGate(x: x, gate: gate), widenOutput: widenOutput)
+        {
+            return y
+        }
+        guard HadamardStridedInputs.enabled, gdnLayout == nil, x.ndim == 4,
+            x.shape == gate.shape, x.dim(2) * x.dim(3) == transform.width,
+            let store = fusedInputStoreDType(rows: x.dim(0) * x.dim(1)),
             let rotated = transform.rotatedSigmoidGate(x, gate: gate, outputDType: store)
         else { return nil }
         return fusedInputForward(rotated, widenOutput: widenOutput)
@@ -605,6 +1462,13 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public func applyAfterGatedRMSNorm(
         _ x: MLXArray, gate z: MLXArray, weight: MLXArray, eps: Float, widenOutput: Bool = true
     ) -> MLXArray? {
+        if let y = tensorRouteForwardProducer(
+            .gatedRMSNorm(x: x, gate: z, weight: weight, eps: eps), widenOutput: widenOutput)
+            ?? tensorRouteNarrowForwardProducer(
+                .gatedRMSNorm(x: x, gate: z, weight: weight, eps: eps), widenOutput: widenOutput)
+        {
+            return y
+        }
         guard let store = fusedInputStoreDType(rows: x.size / max(transform.width, 1)),
             let rotated = transform.rotatedGatedRMSNorm(
                 x, gate: z, weight: weight, eps: eps, layout: gdnLayout, outputDType: store)
@@ -657,8 +1521,48 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         // it. A wide one takes `qmm_t_nax` in the route dtype. BF16
         // activations (the drafter's head input) widen to FP32 exactly, as
         // the core's own promotion would, and a vocabulary head keeps FP32.
-        let inputDType = Self.routeInputDType(
-            rows: rows, n: n, sourceDType: sourceDType)
+        let nTiles = (n + 31) / 32
+        let mTiles = (paddedRows + 31) / 32
+        let narrow = nTiles * mTiles <= splitKTileCeiling
+        // The drafter's shared-head read (a BF16 activation, vocabulary
+        // width): the FP16 read halves the A-fragment and logit traffic of
+        // the 318 MB head pass; its products feed the drafter's own top-k
+        // only, never an emitted token.
+        let float16Head =
+            drafterHeadFloat16 && !narrow && sourceDType == .bfloat16
+            && n >= vocabularyHeadMinimumRows
+        let inputDType: DType =
+            float16Head
+            ? .float16
+            : Self.routeInputDType(rows: rows, n: n, sourceDType: sourceDType)
+        // The vocabulary head at a verify width takes the installed head
+        // kernel: the FP16 read of the rotated activation (the read every
+        // tower projection takes at this width), FP32 accumulation, and the
+        // logits stored in the plain output dtype without the core's FP16
+        // rounding. Declines back to the core's dispatch below.
+        if rows <= tensorRouteMaximumNarrowRows, n >= vocabularyHeadMinimumRows,
+            let head = Self.tensorPackedMatmulHead, let headBiases = biases
+        {
+            var headInput = x.reshaped(rows, k)
+            if headInput.dtype != .float16 {
+                headInput = headInput.asType(.float16)
+            }
+            let padded = tensorRouteMaximumNarrowRows
+            if rows < padded {
+                headInput = concatenated(
+                    [
+                        headInput,
+                        Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: .float16),
+                    ],
+                    axis: 0)
+            }
+            let plainDType: DType = sourceDType == .bfloat16 ? .float32 : sourceDType
+            let headOutputDType: DType = widenOutput ? plainDType : .float16
+            if let y = head(headInput, weight, scales, headBiases, groupSize, headOutputDType) {
+                let logits = rows < padded ? y[0 ..< rows] : y
+                return logits.reshaped(Array(x.shape.dropLast()) + [n])
+            }
+        }
         let routeScales: MLXArray
         let routeBiases: MLXArray?
         if inputDType == .float32 {
@@ -781,6 +1685,11 @@ public func sharedHadamardProjections(
         else { return nil }
         packed.append(layer)
     }
+    if let routed = first.tensorRouteForward(
+        x, siblings: packed, preSigned: false, widenOutput: widenOutput)
+    {
+        return routed
+    }
     // When the siblings will run as one routed stack, rotate straight into the
     // dtype that stack reads: the fused transform folds the cast into its
     // single launch, and the route then has nothing left to cast.
@@ -821,6 +1730,53 @@ public func sharedHadamardSiblings(_ projections: [Linear]) -> [HadamardQuantize
     return packed
 }
 
+/// True when `sharedHadamardProjections` (or its pre-signed form) over an FP32
+/// activation of `rows` rows would run these siblings on the prompt-width
+/// tensor route, quantizing the activation with `forwardInt8`. Siblings must
+/// share one ungrouped transform, as `sharedHadamardSiblings` returns them.
+public func sharedHadamardTensorRouteTakesPrompt(
+    _ siblings: [HadamardQuantizedLinear], rows: Int
+) -> Bool {
+    guard let first = siblings.first,
+        siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
+    else { return false }
+    return first.tensorRouteTakesPrompt(rows: rows, siblings: siblings)
+}
+
+/// True when `sharedHadamardProjections` (or its pre-signed form) over an FP32
+/// activation of a full verify window (`rows` == 16) would run these siblings
+/// on the int8-activation narrow tensor route, quantizing the unpadded
+/// activation with `forwardInt8` (no GDN layout). A quantized rotation formed
+/// elsewhere for these rows then reaches the same matmul through
+/// `sharedHadamardProjectionsQuantized`.
+public func sharedHadamardTensorRouteTakesNarrowInt8(
+    _ siblings: [HadamardQuantizedLinear], rows: Int
+) -> Bool {
+    guard let first = siblings.first,
+        siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
+    else { return false }
+    return first.tensorRouteTakesNarrowInt8(rows: rows, siblings: siblings)
+}
+
+/// `sharedHadamardProjections` for an input whose quantized rotation is
+/// already formed: `activation` must be exactly the tuple `forwardInt8` would
+/// return for the FP32 input reshaped to `[rows, k]` (codes `[rows, k]`,
+/// scales and scaled sums `[rows, k / 128]`), and `leading` the input's shape
+/// without its last axis. The siblings read it through the same prompt-width
+/// matmul. Nil when the route does not take it (the caller then runs
+/// `sharedHadamardProjections` on the input itself).
+public func sharedHadamardProjectionsQuantized(
+    _ activation: SignedBlockHadamard.Int8Activation, leading: [Int],
+    _ siblings: [HadamardQuantizedLinear], widenOutput: Bool = true
+) -> [MLXArray]? {
+    guard let first = siblings.first,
+        siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
+    else { return nil }
+    return first.tensorRouteForwardQuantized(
+        activation, rows: leading.reduce(1, *), leading: leading, siblings: siblings,
+        widenOutput: widenOutput)
+}
+
 /// `sharedHadamardProjections` for an activation that already carries the
 /// shared transform's signs (see `SignedBlockHadamard.applyPreSigned`): the
 /// rotation skips its sign multiply, and every sibling reads the rotated
@@ -832,6 +1788,11 @@ public func sharedHadamardProjectionsPreSigned(
     guard let first = siblings.first,
         siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
     else { return nil }
+    if let routed = first.tensorRouteForward(
+        signed, siblings: siblings, preSigned: true, widenOutput: widenOutput)
+    {
+        return routed
+    }
     // As in `sharedHadamardProjections`: when the siblings run as one routed
     // stack, rotate straight into the dtype the stack reads.
     let k = signed.dim(-1)
@@ -854,6 +1815,37 @@ public func sharedHadamardProjectionsPreSigned(
         return fused
     }
     return siblings.map { $0.applyRotated(rotated) }
+}
+
+/// The dtype `sharedHadamardProjections` (and its pre-signed form) rotates an
+/// FP32 activation of `rows` rows into when these siblings run as one stacked
+/// matrix-route matmul, or nil when that call takes another path (the tensor
+/// route, or one matmul per sibling). Siblings as `sharedHadamardSiblings`
+/// returns them.
+public func sharedHadamardMatrixStackInputDType(
+    _ siblings: [HadamardQuantizedLinear], rows: Int
+) -> DType? {
+    guard let first = siblings.first,
+        siblings.allSatisfy({ $0.sharesInputTransform(with: first) }),
+        !first.tensorRouteMayTake(rows: rows, siblings: siblings),
+        first.fusedSiblingsApply(siblings, rows: rows, k: first.transform.width)
+    else { return nil }
+    return first.fusedSiblingsInputDType(siblings, rows: rows, sourceDType: .float32)
+}
+
+/// The stacked matrix-route projections of an FP32 activation whose rotation
+/// (plain, or pre-signed) is already formed in the dtype
+/// `sharedHadamardMatrixStackInputDType` returned: the same matmul
+/// `sharedHadamardProjections` runs on the rotation it forms itself. Nil when
+/// the stack does not take it.
+public func sharedHadamardProjectionsRotated(
+    _ rotated: MLXArray, _ siblings: [HadamardQuantizedLinear], widenOutput: Bool = true
+) -> [MLXArray]? {
+    guard let first = siblings.first,
+        siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
+    else { return nil }
+    return first.fusedSiblingsForward(
+        rotated, siblings: siblings, widenOutput: widenOutput, sourceDType: .float32)
 }
 
 /// Packed folded embeddings with an inverse transform after lookup.
@@ -906,6 +1898,75 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
     }
 }
 
+/// The row count from which a forward counts as prompt width: the timed
+/// prefill and the seed prefill, never a verify window (at most 17 rows).
+/// Paths measured at prompt width only gate on it (the composed causal
+/// attention of a prompt's query blocks, the fresh recurrent state of a new
+/// request's first chunk), so every verify-width path keeps its kernels.
+/// `MLX_HADAMARD_PROMPT_MIN_ROWS` overrides the default of 64.
+public enum HadamardPromptWidth {
+    public static let minimumRows: Int = {
+        let value = ProcessInfo.processInfo.environment["MLX_HADAMARD_PROMPT_MIN_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.flatMap { Int($0) } ?? 64
+    }()
+}
+
+/// Kernel inputs read in place through their strides. A fused-input rotation
+/// that consumes a column slice of a stacked projection (the gate|up halves,
+/// the GDN z of qkv|z) or a head-strided view (the attention output and its
+/// gate) would otherwise be launched row-contiguous, and MLX copies every such
+/// operand to a fresh buffer first (one copy launch each, at every verify
+/// window). The kernels that opt in index their inputs through the strides
+/// MLX passes instead: the same values, read where they already are.
+/// `MLX_HADAMARD_FUSED_INPUT_STRIDED=0` keeps the row-contiguous launches (and the
+/// copies).
+public enum HadamardStridedInputs {
+    public static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLX_HADAMARD_FUSED_INPUT_STRIDED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Row addressing for an input whose leading `LEAD` dimensions (1 or 2)
+    /// index the rows and whose trailing `TRAIL` dimensions (1 or 2) make up
+    /// a row (the caller reshapes any other layout to `[rows, width]`, a view
+    /// when MLX can collapse it). A kernel takes one uniform branch per
+    /// threadgroup: packed rows (unit innermost stride, a two-dimensional row
+    /// contiguous) keep the plain loads at `row base + column`; anything else
+    /// forms each column's offset from the strides.
+    public static let header = """
+        template <int LEAD>
+        METAL_FUNC int64_t mlxnn_row_base(
+            uint row, constant const int* shape, constant const int64_t* strides) {
+          if (LEAD == 1) {
+            return int64_t(row) * strides[0];
+          }
+          const uint n1 = uint(shape[1]);
+          return (row < n1) ? int64_t(row) * strides[1]
+                            : int64_t(row / n1) * strides[0] + int64_t(row % n1) * strides[1];
+        }
+        template <int LEAD, int TRAIL>
+        METAL_FUNC int64_t mlxnn_col_off(
+            uint c, constant const int* shape, constant const int64_t* strides) {
+          if (TRAIL == 1) {
+            return int64_t(c) * strides[LEAD];
+          }
+          const uint n = uint(shape[LEAD + 1]);
+          return int64_t(c / n) * strides[LEAD] + int64_t(c % n) * strides[LEAD + 1];
+        }
+        template <int LEAD, int TRAIL>
+        METAL_FUNC bool mlxnn_row_packed(constant const int* shape, constant const int64_t* strides) {
+          if (TRAIL == 1) {
+            return strides[LEAD] == 1;
+          }
+          return strides[LEAD + 1] == 1
+              && (shape[LEAD] == 1 || strides[LEAD] == int64_t(shape[LEAD + 1]));
+        }
+
+        """
+}
+
 /// ercumentyildirim's (`ade7529`) fused-INPUT rotations: the SwiGLU product,
 /// the attention output gate, or the GDN output's per-head RMSNorm and gated
 /// tail, formed in the read of MLX's `hadamard_n<float, 1024, 16, 4>` with the
@@ -940,19 +2001,38 @@ enum FusedInputHadamardKernel {
         _ a: MLXArray, _ b: MLXArray, signs: MLXArray, width: Int, mode: Int,
         outputDType: DType = .float32
     ) -> MLXArray {
-        gatedKernel(
-            [a, b, signs],
+        // Rows over the leading one or two dimensions, a row over the
+        // trailing one (`[..., width]`) or two (`[B, S, heads, headDim]`: the
+        // head-transposed attention output and the gate half of each q|gate
+        // head); any other layout is reshaped to `[rows, width]`.
+        var trail = a.dim(-1) == width ? 1 : 2
+        var lead = a.ndim - trail
+        var ra = a
+        var rb = b
+        if lead < 1 || lead > 2 || (trail == 2 && a.dim(-1) * a.dim(-2) != width)
+            || b.shape != a.shape
+        {
+            ra = a.reshaped(a.size / width, width)
+            rb = b.reshaped(a.size / width, width)
+            trail = 1
+            lead = 1
+        }
+        return gatedKernel(
+            [ra, rb, signs],
             template: [
                 ("WIDTH", width), ("MODE", mode), ("InT", a.dtype), ("OutT", outputDType),
+                ("LEAD", lead), ("TRAIL", trail),
             ],
             grid: (64, a.size / 1024, 1),
             threadGroup: (64, 1, 1),
-            outputShapes: [a.shape],
+            outputShapes: [Array(ra.shape.dropLast(trail)) + [width]],
             outputDTypes: [outputDType])[0]
     }
 
     /// MODE 1: `(a * sigmoid(a)) * b` (SwiGLU, inputs FP32 or FP16 widened
-    /// exactly). MODE 2: `a * sigmoid(b)`.
+    /// exactly). MODE 2: `a * sigmoid(b)`. The inputs are read through their
+    /// strides (`HadamardStridedInputs`: rows over the leading LEAD dims, a
+    /// row over the trailing TRAIL dims).
     private static let gatedKernel = MLXFast.metalKernel(
         name: "mlxnn_fused_input_gated_hadamard_1024",
         inputNames: ["a", "b", "signs"],
@@ -964,15 +2044,21 @@ enum FusedInputHadamardKernel {
             uint blk = thread_position_in_grid.y;
             uint row_base = (blk / BLOCKS) * WIDTH;
             uint col0 = (blk % BLOCKS) * 1024;
+            const uint row = blk / BLOCKS;
+            const int64_t ra = mlxnn_row_base<LEAD>(row, a_shape, a_strides);
+            const int64_t rb = mlxnn_row_base<LEAD>(row, b_shape, b_strides);
 
             threadgroup float buf[1024];
 
+            // One uniform branch per threadgroup picks the loads (packed rows
+            // at row base + column, anything else through the strides).
+            auto fill = [&](auto load_a, auto load_b, auto load_s) {
             MLXNN_UNROLL for (short j = 0; j < 4; j++) {
               short index = j * 4 * NT + i * 4;
               MLXNN_UNROLL for (short r = 0; r < 4; r++) {
                 uint p = col0 + index + r;
-                float av = static_cast<float>(a[row_base + p]);
-                float bv = static_cast<float>(b[row_base + p]);
+                float av = load_a(p);
+                float bv = load_b(p);
                 float v;
                 if (MODE == 1) {
                   float t = av * mlxnn_sigmoid(av);
@@ -980,8 +2066,21 @@ enum FusedInputHadamardKernel {
                 } else {
                   v = av * mlxnn_sigmoid(bv);
                 }
-                buf[index + r] = v * signs[p];
+                buf[index + r] = v * load_s(p);
               }
+            }
+            };
+            if (mlxnn_row_packed<LEAD, TRAIL>(a_shape, a_strides)
+                && mlxnn_row_packed<LEAD, TRAIL>(b_shape, b_strides) && signs_strides[0] == 1) {
+              const device InT* ap = a + ra;
+              const device InT* bp = b + rb;
+              fill([&](uint p) { return static_cast<float>(ap[p]); },
+                   [&](uint p) { return static_cast<float>(bp[p]); },
+                   [&](uint p) { return signs[p]; });
+            } else {
+              fill([&](uint p) { return static_cast<float>(a[ra + mlxnn_col_off<LEAD, TRAIL>(p, a_shape, a_strides)]); },
+                   [&](uint p) { return static_cast<float>(b[rb + mlxnn_col_off<LEAD, TRAIL>(p, b_shape, b_strides)]); },
+                   [&](uint p) { return signs[int64_t(p) * signs_strides[0]]; });
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1048,7 +2147,8 @@ enum FusedInputHadamardKernel {
               return (x < 0) ? y : 1 - y;
             }
 
-            """)
+            """ + HadamardStridedInputs.header,
+        ensureRowContiguous: !HadamardStridedInputs.enabled)
 }
 
 extension FusedInputHadamardKernel {
@@ -1087,10 +2187,17 @@ extension FusedInputHadamardKernel {
             uint col0 = (blk % BLOCKS) * 1024;
             uint lane = thread_index_in_simdgroup;
             uint sg = simdgroup_index_in_threadgroup;
+            // x and z [B, S, heads, HEAD_DIM], read through their strides.
+            const uint row = blk / BLOCKS;
+            const int64_t rx = mlxnn_row_base<2>(row, x_shape, x_strides);
+            const int64_t rz = mlxnn_row_base<2>(row, z_shape, z_strides);
 
             threadgroup float buf[1024];
             threadgroup float inv_rms[HEADS_PER_BLOCK];
 
+            // One uniform branch per threadgroup picks the loads (packed rows
+            // at row base + column, anything else through the strides).
+            auto fill = [&](auto load_x, auto load_z, auto load_w, auto load_s) {
             // Per-head RMS as rms_single_row with 32 threads x 4 reads: lane l
             // sums elements 4l..4l+3 of the head in order, then simd_sum.
             MLXNN_UNROLL for (uint hh = sg; hh < HEADS_PER_BLOCK; hh += 2) {
@@ -1098,11 +2205,11 @@ extension FusedInputHadamardKernel {
               uint kh = p0 / (REPEATS * HEAD_DIM);
               uint rep = (p0 % (REPEATS * HEAD_DIM)) / HEAD_DIM;
               uint src_head = rep * KEY_HEADS + kh;
-              const device float* xh = x + row_base + src_head * HEAD_DIM + lane * 4;
+              uint xh = src_head * HEAD_DIM + lane * 4;
               float acc = 0;
               float tx[4];
               MLXNN_UNROLL for (int r = 0; r < 4; r++) {
-                tx[r] = xh[r];
+                tx[r] = load_x(xh + r);
                 acc += tx[r] * tx[r];
               }
               acc = simd_sum(acc);
@@ -1119,12 +2226,25 @@ extension FusedInputHadamardKernel {
                 uint kh = p / (REPEATS * HEAD_DIM);
                 uint rem = p % (REPEATS * HEAD_DIM);
                 uint src = ((rem / HEAD_DIM) * KEY_HEADS + kh) * HEAD_DIM + rem % HEAD_DIM;
-                float xn = w[src % HEAD_DIM] * (x[row_base + src] * inv_rms[(index + r) / HEAD_DIM]);
-                float zv = z[row_base + src];
+                float xn = load_w(src % HEAD_DIM) * (load_x(src) * inv_rms[(index + r) / HEAD_DIM]);
+                float zv = load_z(src);
                 float gz = zv * mlxnn_sigmoid(zv);
                 float v = gz * xn;
-                buf[index + r] = v * signs[p];
+                buf[index + r] = v * load_s(p);
               }
+            }
+            };
+            if (mlxnn_row_packed<2, 2>(x_shape, x_strides) && mlxnn_row_packed<2, 2>(z_shape, z_strides)
+                && w_strides[0] == 1 && signs_strides[0] == 1) {
+              const auto xp = x + rx;
+              const auto zp = z + rz;
+              fill([&](uint c) { return float(xp[c]); }, [&](uint c) { return float(zp[c]); },
+                   [&](uint c) { return w[c]; }, [&](uint c) { return signs[c]; });
+            } else {
+              fill([&](uint c) { return float(x[rx + mlxnn_col_off<2, 2>(c, x_shape, x_strides)]); },
+                   [&](uint c) { return float(z[rz + mlxnn_col_off<2, 2>(c, z_shape, z_strides)]); },
+                   [&](uint c) { return w[int64_t(c) * w_strides[0]]; },
+                   [&](uint c) { return signs[int64_t(c) * signs_strides[0]]; });
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1191,7 +2311,8 @@ extension FusedInputHadamardKernel {
               return (x < 0) ? y : 1 - y;
             }
 
-            """)
+            """ + HadamardStridedInputs.header,
+        ensureRowContiguous: !HadamardStridedInputs.enabled)
 }
 
 /// The one-launch forward transform: the FP32 sign multiply, the 1024-block
