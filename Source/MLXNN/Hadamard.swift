@@ -509,10 +509,29 @@ private final class HadamardMatrixRouteOperands {
     /// `HadamardFusedSiblings`. Owned by the first sibling's operands.
     var fusedSiblings: HadamardFusedSiblings?
     let layoutCache = HadamardConstantLayoutCache()
+    /// FP32 copies of the FP16 scales and offsets, built once by
+    /// `prepareWideConstants()` outside any compiled trace.
+    private var wideScales: MLXArray?
+    private var wideBiases: MLXArray?
 
     func clear() {
-        lock.withLock { fusedSiblings = nil }
+        lock.withLock {
+            fusedSiblings = nil
+            wideScales = nil
+            wideBiases = nil
+        }
         layoutCache.clear()
+    }
+
+    func setWide(scales: MLXArray, biases: MLXArray?) {
+        lock.withLock {
+            wideScales = scales
+            wideBiases = biases
+        }
+    }
+
+    func wide() -> (scales: MLXArray, biases: MLXArray?)? {
+        lock.withLock { wideScales.map { ($0, wideBiases) } }
     }
 
     /// The stacked operand for exactly these siblings, built on first use and
@@ -637,7 +656,29 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         if let routed = matrixRegimeForward(rotated) {
             return routed
         }
+        // An FP32 input would make the core widen the FP16 constants on every
+        // call; use the copies `prepareWideConstants()` built once instead.
+        if rotated.dtype == .float32, mode == .affine, globalScale == nil,
+            let wide = matrixRoute.wide(), (biases == nil) == (wide.biases == nil)
+        {
+            var out = quantizedMM(
+                rotated, weight, scales: wide.scales, biases: wide.biases,
+                transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+            if let bias { out = out + bias }
+            return out
+        }
         return super.callAsFunction(rotated)
+    }
+
+    /// Builds FP32 copies of the FP16 scales and offsets once, so FP32
+    /// activations stop widening them on every call. Call it after loading and
+    /// outside any compiled trace; it costs twice the constants' size in memory.
+    public func prepareWideConstants() {
+        guard mode == .affine, scales.dtype == .float16 else { return }
+        let wideScales = scales.asType(.float32)
+        let wideBiases = biases?.asType(.float32)
+        eval([wideScales] + (wideBiases.map { [$0] } ?? []))
+        matrixRoute.setWide(scales: wideScales, biases: wideBiases)
     }
 
     // MARK: - Matrix-regime route
@@ -1566,10 +1607,15 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         let routeScales: MLXArray
         let routeBiases: MLXArray?
         if inputDType == .float32 {
-            // The FP32 read widens the packed FP16 constants, as the core's
-            // own promotion would.
-            routeScales = scales.asType(.float32)
-            routeBiases = biases.map { $0.asType(.float32) }
+            // The FP32 read needs FP32 constants: the prepared copies when
+            // present, otherwise the same widening the core would do.
+            if let wide = operands.wide(), (biases == nil) == (wide.biases == nil) {
+                routeScales = wide.scales
+                routeBiases = wide.biases
+            } else {
+                routeScales = scales.asType(.float32)
+                routeBiases = biases.map { $0.asType(.float32) }
+            }
         } else {
             routeScales = scales
             routeBiases = biases
