@@ -114,8 +114,8 @@ ran. The Linux container changes require separate build validation.
 
 Use SwiftPM or the Xcode package scheme for the fork kernels. The existing CMake
 build fetches upstream MLX and MLX-C instead of the fork's pinned submodules and
-does not provide the fork kernels. The MLX-C submodule itself currently uses the
-`bri-prism/mlx-c` fork; cloning with submodules requires access to that repository.
+does not provide the fork kernels. The MLX-C submodule uses the
+[PrismML-Eng/mlx-c](https://github.com/PrismML-Eng/mlx-c) fork.
 
 ---
 
