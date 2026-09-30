@@ -26,11 +26,17 @@ git checkout prism
 git submodule update --init
 ```
 
-Regenerate Metal shaders and build:
+Regenerate Metal shaders and build with Xcode 27:
 
 ```bash
 ./tools/update-mlx.sh
 swift build
+```
+
+With Xcode 26, use Xcode's package build so that it also builds the Metal library:
+
+```sh
+xcodebuild build -scheme mlx-swift-Package -destination 'platform=macOS'
 ```
 
 ## Quantization Format
@@ -53,6 +59,63 @@ Models use SafeTensors format with `config.json` containing:
 - [PrismML-Eng/mlx](https://github.com/PrismML-Eng/mlx/tree/prism) — MLX C++ core with 1-bit kernel support
 - [ml-explore/mlx-swift](https://github.com/ml-explore/mlx-swift) — Upstream mlx-swift
 - [ml-explore/mlx](https://github.com/ml-explore/mlx) — Upstream MLX framework
+
+## Upstream 0.32.2 compatibility
+
+The `prism` development line integrates the Swift 0.32.2 release while retaining
+the fork's low-bit kernels and signed Hadamard layers. Its pinned MLX core includes
+upstream MLX 0.32.2 plus subsequent fork changes; this is not an unmodified upstream
+0.32.2 core.
+
+The older `v0.31.6_prism` branch is unchanged. Consumers pinned to that branch do
+not receive development-line fixes automatically. Update the package revision and
+rebuild the Metal library together; do not reuse a library from the older runtime.
+
+M5 desktop GPUs use the Neural Accelerator paths supported by the pinned core.
+`PrismNAXRegressionTests` compares dense and low-bit matmuls at the historical M5
+failure shapes, and head-dimension-256 attention, against FP32 CPU references. The
+tests cover FP16 and BF16 inputs and 1-, 2-, and 4-bit affine weights. Additional
+cases cover FP32/FP16 split-K tiles (including partial tiles) and short non-causal
+head-dimension-128 attention.
+
+Run the focused checks on a Metal-capable Mac with Xcode 27:
+
+```sh
+swift test -c release -Xswiftc -DDEBUG \
+  --filter 'Prism|Hadamard|StreamTests|DeviceTests|SaveTests'
+```
+
+The debug define enables the upstream test suite's wired-memory testing hooks.
+With Xcode 26, `swift test` can fail with `Failed to load the default metallib`.
+Use the Xcode package scheme, which builds the Metal library, instead:
+
+```sh
+xcodebuild test -scheme mlx-swift-Package -configuration Debug \
+  -destination 'platform=macOS' \
+  -only-testing:MLXTests/PrismNAXRegressionTests \
+  -only-testing:MLXTests/PrismHadamardTests \
+  -only-testing:MLXTests/HadamardLayerTests \
+  -only-testing:MLXTests/HadamardFusedInputTests \
+  -only-testing:MLXTests/PrismReleaseQuantizationTests \
+  -only-testing:MLXTests/PrismSymmetricQuantizationTests \
+  -only-testing:MLXTests/StreamTests \
+  -only-testing:MLXTests/SaveTests
+```
+
+For consumer migration, review the upstream release's task-local stream/device
+semantics and changed defaults for `tensordot`, `nanToNum`, and `linspace`.
+
+### Build and CI scope
+
+The fork's current GitHub workflow gates lint and macOS build/test jobs on the
+upstream repository name. Linux build jobs depend on lint, so they are also
+skipped here. Passing CodeQL checks do not establish that these builds or tests
+ran. The Linux container changes require separate build validation.
+
+Use SwiftPM or the Xcode package scheme for the fork kernels. The existing CMake
+build fetches upstream MLX and MLX-C instead of the fork's pinned submodules and
+does not provide the fork kernels. The MLX-C submodule uses the
+[PrismML-Eng/mlx-c](https://github.com/PrismML-Eng/mlx-c) fork.
 
 ---
 
