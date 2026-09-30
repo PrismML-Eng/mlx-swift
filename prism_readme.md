@@ -26,11 +26,17 @@ git checkout prism
 git submodule update --init
 ```
 
-Regenerate Metal shaders and build:
+Regenerate Metal shaders and build with Xcode 27:
 
 ```bash
 ./tools/update-mlx.sh
 swift build
+```
+
+With Xcode 26, use Xcode's package build so that it also builds the Metal library:
+
+```sh
+xcodebuild build -scheme mlx-swift-Package -destination 'platform=macOS'
 ```
 
 ## Quantization Format
@@ -72,7 +78,7 @@ tests cover FP16 and BF16 inputs and 1-, 2-, and 4-bit affine weights. Additiona
 cases cover FP32/FP16 split-K tiles (including partial tiles) and short non-causal
 head-dimension-128 attention.
 
-Run the focused checks on a Metal-capable Mac:
+Run the focused checks on a Metal-capable Mac with Xcode 27:
 
 ```sh
 swift test -c release -Xswiftc -DDEBUG \
@@ -80,8 +86,36 @@ swift test -c release -Xswiftc -DDEBUG \
 ```
 
 The debug define enables the upstream test suite's wired-memory testing hooks.
+With Xcode 26, `swift test` can fail with `Failed to load the default metallib`.
+Use the Xcode package scheme, which builds the Metal library, instead:
+
+```sh
+xcodebuild test -scheme mlx-swift-Package -configuration Debug \
+  -destination 'platform=macOS' \
+  -only-testing:MLXTests/PrismNAXRegressionTests \
+  -only-testing:MLXTests/PrismHadamardTests \
+  -only-testing:MLXTests/HadamardLayerTests \
+  -only-testing:MLXTests/HadamardFusedInputTests \
+  -only-testing:MLXTests/PrismReleaseQuantizationTests \
+  -only-testing:MLXTests/PrismSymmetricQuantizationTests \
+  -only-testing:MLXTests/StreamTests \
+  -only-testing:MLXTests/SaveTests
+```
+
 For consumer migration, review the upstream release's task-local stream/device
 semantics and changed defaults for `tensordot`, `nanToNum`, and `linspace`.
+
+### Build and CI scope
+
+The fork's current GitHub workflow gates lint and macOS build/test jobs on the
+upstream repository name. Linux build jobs depend on lint, so they are also
+skipped here. Passing CodeQL checks do not establish that these builds or tests
+ran. The Linux container changes require separate build validation.
+
+Use SwiftPM or the Xcode package scheme for the fork kernels. The existing CMake
+build fetches upstream MLX and MLX-C instead of the fork's pinned submodules and
+does not provide the fork kernels. The MLX-C submodule itself currently uses the
+`bri-prism/mlx-c` fork; cloning with submodules requires access to that repository.
 
 ---
 
