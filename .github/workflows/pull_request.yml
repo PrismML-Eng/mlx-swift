@@ -104,21 +104,14 @@ jobs:
 
       - name: Build SwiftPM (Xcode, macOS)
         shell: sh
-        env:
-          # workaround for CI failure
-          DEVELOPER_DIR: /Applications/Xcode-latest.app
         run: |
           xcodebuild -version
-          xcrun --show-sdk-build-version
           swift --version
           rm -rf ~/Library/Developer/Xcode/DerivedData/*
           xcodebuild build-for-testing -scheme mlx-swift-Package -destination 'platform=macOS'
 
       - name: Run Tests SwiftPM (Xcode, macOS)
         shell: sh
-        env:
-          # workaround for CI failure
-          DEVELOPER_DIR: /Applications/Xcode-latest.app
         run: |
           xcrun xctest ~/Library/Developer/Xcode/DerivedData/mlx-swift-*/Build/Products/Debug/CmlxTests.xctest
           xcrun xctest ~/Library/Developer/Xcode/DerivedData/mlx-swift-*/Build/Products/Debug/MLXTests.xctest
@@ -132,18 +125,12 @@ jobs:
 
       - name: Build xcodeproj (Xcode, macOS)
         shell: sh
-        env:
-          # workaround for CI failure
-          DEVELOPER_DIR: /Applications/Xcode-latest.app
         run: |
           rm -rf ~/Library/Developer/Xcode/DerivedData/*
           cd xcode
           xcodebuild build-for-testing -scheme MLX -destination 'platform=macOS'
 
       - name: Run Tests xcodeproj (Xcode, macOS)
-        env:
-          # workaround for CI failure
-          DEVELOPER_DIR: /Applications/Xcode-latest.app
         working-directory: xcode
         run: ../.github/scripts/run-xcode-tests.sh
 
@@ -175,15 +162,20 @@ jobs:
       matrix:
         include:
           # See https://github.com/swiftlang/swift-docker/tree/main/
+          #
+          # Note: mlx-c uses std::format, which requires libstdc++ >= 13 (or
+          # libc++ >= 17).  Debian bookworm only ships gcc/libstdc++ 12 (and
+          # gcc-13 is not available in bookworm-backports), so use Ubuntu
+          # noble (24.04, gcc/libstdc++ 13) for the Debian-family build.
           - host: ubuntu-22.04
             arch: x86_64
-            container: swift:bookworm
+            container: swift:noble
           - host: ubuntu-22.04
             arch: x86_64
             container: swift:fedora39
           - host: ubuntu-22.04-arm
             arch: aarch64
-            container: swift:bookworm
+            container: swift:noble
           - host: ubuntu-22.04-arm
             arch: aarch64
             container: swift:fedora39

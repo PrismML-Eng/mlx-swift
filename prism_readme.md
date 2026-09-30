@@ -54,6 +54,33 @@ Models use SafeTensors format with `config.json` containing:
 - [ml-explore/mlx-swift](https://github.com/ml-explore/mlx-swift) — Upstream mlx-swift
 - [ml-explore/mlx](https://github.com/ml-explore/mlx) — Upstream MLX framework
 
+## Upstream 0.32.2 compatibility
+
+The `prism` development line integrates the Swift 0.32.2 release while retaining
+the fork's low-bit kernels and signed Hadamard layers. Its pinned MLX core includes
+upstream MLX 0.32.2 plus subsequent fork changes; this is not an unmodified upstream
+0.32.2 core.
+
+The older `v0.31.6_prism` branch is unchanged. Consumers pinned to that branch do
+not receive development-line fixes automatically. Update the package revision and
+rebuild the Metal library together; do not reuse a library from the older runtime.
+
+M5 desktop GPUs use the Neural Accelerator paths supported by the pinned core.
+`PrismNAXRegressionTests` compares dense and low-bit matmuls at the historical M5
+failure shapes, and head-dimension-256 attention, against FP32 CPU references. The
+tests cover FP16 and BF16 inputs and 1-, 2-, and 4-bit affine weights.
+
+Run the focused checks on a Metal-capable Mac:
+
+```sh
+swift test -c release -Xswiftc -DDEBUG \
+  --filter 'Prism|Hadamard|StreamTests|DeviceTests|SaveTests'
+```
+
+The debug define enables the upstream test suite's wired-memory testing hooks.
+For consumer migration, review the upstream release's task-local stream/device
+semantics and changed defaults for `tensordot`, `nanToNum`, and `linspace`.
+
 ---
 
 ## Appendix
