@@ -68,7 +68,9 @@ rebuild the Metal library together; do not reuse a library from the older runtim
 M5 desktop GPUs use the Neural Accelerator paths supported by the pinned core.
 `PrismNAXRegressionTests` compares dense and low-bit matmuls at the historical M5
 failure shapes, and head-dimension-256 attention, against FP32 CPU references. The
-tests cover FP16 and BF16 inputs and 1-, 2-, and 4-bit affine weights.
+tests cover FP16 and BF16 inputs and 1-, 2-, and 4-bit affine weights. Additional
+cases cover FP32/FP16 split-K tiles (including partial tiles) and short non-causal
+head-dimension-128 attention.
 
 Run the focused checks on a Metal-capable Mac:
 

@@ -28,6 +28,7 @@ elif command -v dnf >/dev/null 2>&1; then
         make \
         cmake \
         clang \
+        gcc-c++ \
         ninja-build
 
     # Fedora's default gcc (13+) has <format>; keep it as the compiler so this
