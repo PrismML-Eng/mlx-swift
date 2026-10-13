@@ -691,6 +691,15 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// Fewer rows than this skip the matrix route and take the core's dispatch.
+    /// Padding 2 or 3 rows up to `matrixRegimeMinimumRows` costs more than the
+    /// vector kernel saves; `MLX_HADAMARD_MATRIX_ROUTE_MIN_ROWS` overrides it.
+    static let matrixRouteMinimumRows: Int = {
+        let value = ProcessInfo.processInfo.environment["MLX_HADAMARD_MATRIX_ROUTE_MIN_ROWS"]
+        return value.flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            .map { max($0, 2) } ?? 4
+    }()
+
     /// The dtype the packed matmul reads its rotated activation in on the
     /// matrix-regime route. FP16 is the published Prism runtime's own choice
     /// for this pack (its packed constants are FP16, so nothing is widened);
@@ -847,7 +856,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             x.ndim >= 2
         else { return nil }
         let k = x.dim(-1)
-        guard x.size / k >= 2, k % 64 == 0, k % groupSize == 0 else { return nil }
+        guard x.size / k >= Self.matrixRouteMinimumRows, k % 64 == 0, k % groupSize == 0
+        else { return nil }
         return Self.matrixRoutedMatmul(
             x, weight: weight, scales: scales, biases: biases,
             groupSize: groupSize, bits: bits, mode: mode, operands: matrixRoute,
@@ -1381,7 +1391,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// (so the route never casts it again). Nil when the route does not apply.
     private func fusedInputStoreDType(rows: Int) -> DType? {
         let k = transform.width
-        guard Self.routeApplies(to: self), rows >= 2, k % 64 == 0, k % groupSize == 0
+        guard Self.routeApplies(to: self), rows >= Self.matrixRouteMinimumRows, k % 64 == 0,
+            k % groupSize == 0
         else { return nil }
         // At prompt width the tensor route (raw codes on the tensor unit, an
         // 8-bit activation) takes the projection instead; its callers fall
@@ -1673,7 +1684,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     fileprivate func fusedSiblingsApply(
         _ siblings: [HadamardQuantizedLinear], rows: Int, k: Int
     ) -> Bool {
-        guard Self.siblingFusionEnabled, siblings.count >= 2, rows >= 2, k % 64 == 0
+        guard Self.siblingFusionEnabled, siblings.count >= 2, rows >= Self.matrixRouteMinimumRows,
+            k % 64 == 0
         else { return false }
         for sibling in siblings {
             guard Self.routeApplies(to: sibling), sibling.groupSize == groupSize,
